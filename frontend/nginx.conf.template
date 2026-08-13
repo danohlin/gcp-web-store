@@ -1,0 +1,95 @@
+server {
+    listen 8080;
+    server_name _;
+
+    root /usr/share/nginx/html;
+    index index.html;
+
+    # Behind an ALB the real client address arrives in X-Forwarded-For.
+    real_ip_header X-Forwarded-For;
+    set_real_ip_from 0.0.0.0/0;
+
+    # Do not advertise the nginx version on error pages or in the Server header.
+    server_tokens off;
+
+    include /etc/nginx/security-headers.conf;
+
+    gzip on;
+    gzip_vary on;
+    gzip_min_length 1024;
+    gzip_types text/plain text/css application/javascript application/json image/svg+xml;
+
+    # --- probes -------------------------------------------------------------
+    # Served by nginx itself, so readiness never depends on the backend.
+    location = /healthz {
+        include /etc/nginx/security-headers.conf;
+        access_log off;
+        add_header Content-Type application/json;
+        return 200 '{"status":"ok"}';
+    }
+
+    # --- api ----------------------------------------------------------------
+    # Proxied rather than called cross-origin, which keeps the refresh and cart
+    # cookies first-party. In EKS the ALB also routes /api straight to the
+    # backend; both paths preserve the same origin.
+    #
+    # No security-headers include here on purpose: these are the API's own
+    # responses, and the backend sets its headers via helmet.
+    location /api/ {
+        # Resolved per request, not once at startup.
+        #
+        # A literal hostname in proxy_pass is resolved when nginx loads its
+        # config, so if the backend Service is not yet in DNS the container dies
+        # with "host not found in upstream" and crashloops until it is. Assigning
+        # to a variable defers resolution to request time, which also means a
+        # backend restart or Service IP change needs no nginx restart.
+        #
+        # With a variable, nginx no longer appends the matched location URI, so
+        # $request_uri has to be passed explicitly — it carries the full path and
+        # query string.
+        #
+        # NGINX_LOCAL_RESOLVERS is exported by the image's own entrypoint from
+        # /etc/resolv.conf, so this works unchanged in compose and in Kubernetes.
+        resolver ${NGINX_LOCAL_RESOLVERS} valid=10s ipv6=off;
+        set $api_backend "${BACKEND_ORIGIN}";
+        proxy_pass $api_backend$request_uri;
+
+        proxy_http_version 1.1;
+        proxy_set_header Host              $host;
+        proxy_set_header X-Real-IP         $remote_addr;
+        proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header Connection        "";
+
+        # Checkout calls a payment gateway; the 60s default is tight if a real
+        # provider is slow to answer.
+        proxy_connect_timeout 5s;
+        proxy_read_timeout    75s;
+        proxy_send_timeout    75s;
+
+        proxy_buffering off;
+    }
+
+    # --- static assets ------------------------------------------------------
+    # Filenames are content-hashed by the bundler, so these can be cached hard.
+    location /assets/ {
+        include /etc/nginx/security-headers.conf;
+        expires 1y;
+        add_header Cache-Control "public, immutable" always;
+        access_log off;
+        try_files $uri =404;
+    }
+
+    # --- SPA fallback -------------------------------------------------------
+    # index.html must never be cached, or a browser will keep loading an old
+    # build that references asset filenames the server no longer has.
+    location = /index.html {
+        include /etc/nginx/security-headers.conf;
+        add_header Cache-Control "no-cache, no-store, must-revalidate" always;
+        expires 0;
+    }
+
+    location / {
+        try_files $uri $uri/ /index.html;
+    }
+}

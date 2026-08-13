@@ -1,0 +1,215 @@
+name: Version audit
+
+# Every pinned external version in this repository is a hardcoded literal with
+# no mechanism to notice when it goes stale. That gap has bitten twice already:
+# EKS was pinned to a version four months past end of standard support, which
+# silently quadruples the bill, and the vendored ALB controller IAM policy
+# drifted two majors behind its own chart, withholding a permission the Ingress
+# depends on.
+#
+# This checks the pins against reality once a week and opens an issue when
+# something needs attention. It is read-only and changes nothing.
+
+on:
+  schedule:
+    # Monday morning, so anything found lands at the start of a week.
+    - cron: '0 8 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+  id-token: write
+
+env:
+  AWS_REGION: us-east-1
+
+jobs:
+  audit:
+    name: Check pinned versions
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # Read-only AWS access, needed for the EKS support dates. Uses the same
+      # OIDC role as deploys; it can describe but not create.
+      - name: Assume the deploy role
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: gha-audit-${{ github.run_id }}
+
+      - uses: azure/setup-helm@v4
+
+      - name: Audit
+        id: audit
+        run: |
+          # shellcheck disable=SC2016
+          # This script is largely regex over config files. Single quotes are
+          # correct throughout: every $ here is an end-of-line anchor or a
+          # literal PowerShell sigil being matched, never a variable to expand.
+          set -uo pipefail
+          FINDINGS=""
+          note() { FINDINGS="${FINDINGS}- $1"$'\n'; echo "::warning::$1"; }
+
+          # An audit that silently extracts nothing reports "all clear" while
+          # checking nothing, which is worse than not running. Every value below
+          # is required to be non-empty and version-shaped, and the job fails
+          # loudly if a pattern stops matching because a file was reformatted.
+          require() {
+            local name="$1" value="$2"
+            if ! printf '%s' "$value" | grep -qE '^[0-9]+(\.[0-9]+)+$'; then
+              echo "::error::Could not extract ${name} (got '${value}'). A pattern in this workflow no longer matches the source file."
+              exit 1
+            fi
+          }
+
+          # ---------------------------------------------------------------
+          # EKS: is the pinned version still in standard support?
+          #
+          # A cluster past that date keeps working and moves to extended
+          # support at $0.60/hr instead of $0.10 — nothing fails, the bill
+          # just grows. This is the check that matters most.
+          # ---------------------------------------------------------------
+          # awk over the whole variable block rather than a fixed -A window:
+          # the description is a long heredoc and grep -A20 stopped short of
+          # the default, silently yielding an empty version.
+          PINNED_EKS=$(awk '/variable "kubernetes_version"/,/^}/' infra/ephemeral/variables.tf \
+                       | grep -m1 'default' | sed -E 's/.*"([0-9.]+)".*/\1/')
+          require 'the pinned EKS version' "$PINNED_EKS"
+          EOL=$(aws eks describe-cluster-versions --region "$AWS_REGION" \
+                --query "clusterVersions[?clusterVersion=='${PINNED_EKS}'].endOfStandardSupportDate" \
+                --output text 2>/dev/null | cut -d'T' -f1)
+          NEWEST=$(aws eks describe-cluster-versions --region "$AWS_REGION" \
+                   --query 'clusterVersions[].clusterVersion' --output text 2>/dev/null | tr '\t' '\n' | sort -V | tail -1)
+
+          echo "EKS pinned=$PINNED_EKS end-of-standard-support=$EOL newest=$NEWEST"
+          if [ -n "$EOL" ]; then
+            if [ "$(date -u +%Y-%m-%d)" \> "$EOL" ]; then
+              note "**EKS ${PINNED_EKS} is past end of standard support** (ended ${EOL}). The control plane now bills at \$0.60/hr instead of \$0.10. Newest available: ${NEWEST}. Fix: \`kubernetes_version\` in \`infra/ephemeral/variables.tf\`."
+            elif [ "$(date -u -d '+90 days' +%Y-%m-%d)" \> "$EOL" ]; then
+              note "EKS ${PINNED_EKS} leaves standard support on ${EOL}, within 90 days. Newest available: ${NEWEST}."
+            fi
+          fi
+
+          # ---------------------------------------------------------------
+          # ALB controller: chart pin vs the vendored IAM policy
+          #
+          # These are a matched pair. Letting them drift withheld
+          # elasticloadbalancing:SetRulePriorities, which is how the ALB
+          # orders routing rules — so /api stops taking precedence over the
+          # catch-all, on an arbitrary day, with nothing changed locally.
+          # ---------------------------------------------------------------
+          # Anchored to the assignment. An unanchored grep matched the doc
+          # comment above it, which mentions the variable by name. The leading
+          # '.' matches PowerShell's $ sigil without embedding a literal $.
+          CHART_PIN=$(grep -m1 '^.ALB_CHART_VERSION' scripts/up.ps1 | sed -E "s/.*'([0-9.]+)'.*/\1/")
+          POLICY_VER=$(grep -m1 'upstream policy v' infra/ephemeral/iam-irsa.tf | sed -E 's/.*v([0-9.]+).*/\1/')
+          require 'the ALB chart pin' "$CHART_PIN"
+          require 'the vendored ALB policy version' "$POLICY_VER"
+          echo "ALB chart pin=$CHART_PIN vendored policy=$POLICY_VER"
+          if [ "$CHART_PIN" != "$POLICY_VER" ]; then
+            note "**ALB controller chart (${CHART_PIN}) and its vendored IAM policy (${POLICY_VER}) disagree.** Re-vendor from \`https://raw.githubusercontent.com/kubernetes-sigs/aws-load-balancer-controller/v${CHART_PIN}/docs/install/iam_policy.json\`."
+          fi
+
+          # Does upstream still publish the policy we vendored?
+          if ! curl -sfI "https://raw.githubusercontent.com/kubernetes-sigs/aws-load-balancer-controller/v${POLICY_VER}/docs/install/iam_policy.json" >/dev/null; then
+            note "The vendored ALB IAM policy claims v${POLICY_VER}, but upstream has no such tag. The version comment is wrong."
+          fi
+
+          # ---------------------------------------------------------------
+          # Helm charts: newer major available?
+          # ---------------------------------------------------------------
+          helm repo add eks https://aws.github.io/eks-charts >/dev/null 2>&1
+          helm repo add secrets-store-csi-driver https://kubernetes-sigs.github.io/secrets-store-csi-driver/charts >/dev/null 2>&1
+          helm repo add aws-secrets-manager https://aws.github.io/secrets-store-csi-driver-provider-aws >/dev/null 2>&1
+          helm repo update >/dev/null 2>&1
+
+          check_chart() {
+            local repo="$1" var="$2" label="$3"
+            local pin latest
+            pin=$(grep -m1 "^.${var}" scripts/up.ps1 | sed -E "s/.*'([0-9.]+)'.*/\1/")
+            require "the ${label} pin" "$pin"
+            latest=$(helm search repo "$repo" --output json 2>/dev/null | jq -r '.[0].version // empty')
+            echo "$label pin=$pin latest=$latest"
+            if [ -n "$latest" ] && [ "${pin%%.*}" != "${latest%%.*}" ]; then
+              note "${label} is pinned at ${pin}; ${latest} is a newer major. Review before bumping — for the ALB controller the IAM policy must move with it."
+            fi
+          }
+          check_chart eks/aws-load-balancer-controller ALB_CHART_VERSION 'ALB controller chart'
+          check_chart secrets-store-csi-driver/secrets-store-csi-driver CSI_DRIVER_CHART_VERSION 'Secrets Store CSI driver chart'
+          check_chart aws-secrets-manager/secrets-store-csi-driver-provider-aws CSI_AWS_CHART_VERSION 'CSI AWS provider chart'
+
+          # ---------------------------------------------------------------
+          # Terraform AWS provider
+          # ---------------------------------------------------------------
+          PROV_PIN=$(grep -m1 -A1 'hashicorp/aws' infra/ephemeral/versions.tf | grep version | sed -E 's/.*~> ([0-9.]+).*/\1/')
+          require 'the AWS provider constraint' "$PROV_PIN"
+          PROV_LATEST=$(curl -s https://api.github.com/repos/hashicorp/terraform-provider-aws/releases/latest | jq -r '.tag_name' | tr -d 'v')
+          echo "AWS provider pin=$PROV_PIN latest=$PROV_LATEST"
+          if [ "${PROV_PIN%%.*}" != "${PROV_LATEST%%.*}" ]; then
+            note "Terraform AWS provider is constrained to ~> ${PROV_PIN}; ${PROV_LATEST} is a newer major. HashiCorp concentrates fixes on the current major."
+          fi
+
+          # ---------------------------------------------------------------
+          # nginx base image — the one component facing the internet
+          # ---------------------------------------------------------------
+          NGINX_PIN=$(grep -m1 'FROM nginxinc/nginx-unprivileged' frontend/Dockerfile | sed -E 's/.*:([0-9.]+)-alpine.*/\1/')
+          require 'the nginx pin' "$NGINX_PIN"
+          NGINX_LATEST=$(curl -s 'https://hub.docker.com/v2/repositories/nginxinc/nginx-unprivileged/tags?page_size=100&name=-alpine' \
+                         | jq -r '.results[].name' | grep -E '^[0-9]+\.[0-9]+-alpine$' | sed 's/-alpine//' | sort -V | tail -1)
+          echo "nginx pin=$NGINX_PIN latest=$NGINX_LATEST"
+          if [ -n "$NGINX_LATEST" ] && [ "$NGINX_PIN" != "$NGINX_LATEST" ]; then
+            note "nginx is pinned at ${NGINX_PIN}; ${NGINX_LATEST} is available. It is the only internet-facing component, so security fixes matter."
+          fi
+
+          # ---------------------------------------------------------------
+          {
+            echo "findings<<EOF"
+            echo "$FINDINGS"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+          if [ -n "$FINDINGS" ]; then
+            echo "has_findings=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_findings=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::All pinned versions are current."
+          fi
+
+      - name: Open or update an issue
+        if: steps.audit.outputs.has_findings == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          FINDINGS: ${{ steps.audit.outputs.findings }}
+        run: |
+          set -euo pipefail
+          TITLE="Pinned versions need attention"
+          BODY=$(printf '%s\n\n%s\n\n%s\n' \
+            "The weekly version audit found the following. Each was checked against upstream, not inferred." \
+            "$FINDINGS" \
+            "_Raised by [\`version-audit.yml\`](../blob/main/.github/workflows/version-audit.yml). Re-run it after fixing to close this out._")
+
+          # Reuse the open issue rather than filing a new one every Monday.
+          EXISTING=$(gh issue list --state open --search "$TITLE in:title" --json number --jq '.[0].number // empty')
+          if [ -n "$EXISTING" ]; then
+            gh issue comment "$EXISTING" --body "$BODY"
+          else
+            gh issue create --title "$TITLE" --body "$BODY" --label dependencies 2>/dev/null \
+              || gh issue create --title "$TITLE" --body "$BODY"
+          fi
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "### Version audit"
+            echo ""
+            if [ "${{ steps.audit.outputs.has_findings }}" = "true" ]; then
+              echo "${{ steps.audit.outputs.findings }}"
+            else
+              echo "All pinned versions are current."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"

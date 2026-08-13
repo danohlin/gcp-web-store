@@ -1,0 +1,324 @@
+// Web Store data model.
+//
+// Conventions:
+//   * All monetary amounts are integer minor units (cents). Never floats.
+//   * All primary keys are UUIDs so IDs are safe to expose in URLs.
+//   * Table/column names are snake_case via @map to stay idiomatic in SQL.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum Role {
+  CUSTOMER
+  ADMIN
+}
+
+enum CartStatus {
+  ACTIVE
+  CONVERTED
+  ABANDONED
+}
+
+enum OrderStatus {
+  PENDING_PAYMENT
+  PAID
+  PROCESSING
+  SHIPPED
+  DELIVERED
+  CANCELLED
+  REFUNDED
+}
+
+enum PaymentStatus {
+  PENDING
+  AUTHORIZED
+  CAPTURED
+  FAILED
+  REFUNDED
+}
+
+// ---------------------------------------------------------------- identity
+
+model User {
+  id           String  @id @default(uuid()) @db.Uuid
+  // Stored lower-cased by the auth service so uniqueness is case-insensitive
+  // without requiring the citext extension.
+  email        String  @unique
+  passwordHash String  @map("password_hash")
+  firstName    String? @map("first_name")
+  lastName     String? @map("last_name")
+  role         Role    @default(CUSTOMER)
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  refreshTokens       RefreshToken[]
+  passwordResetTokens PasswordResetToken[]
+  addresses           Address[]
+  carts               Cart[]
+  orders              Order[]
+
+  @@map("users")
+}
+
+// Refresh tokens are stored hashed and rotated on every use. `replacedById`
+// forms a chain so that reuse of a retired token can be detected and the whole
+// family revoked.
+model RefreshToken {
+  id        String    @id @default(uuid()) @db.Uuid
+  userId    String    @map("user_id") @db.Uuid
+  tokenHash String    @unique @map("token_hash")
+  expiresAt DateTime  @map("expires_at")
+  revokedAt DateTime? @map("revoked_at")
+
+  replacedById String?        @unique @map("replaced_by_id") @db.Uuid
+  replacedBy   RefreshToken?  @relation("TokenRotation", fields: [replacedById], references: [id], onDelete: SetNull)
+  replaces     RefreshToken?  @relation("TokenRotation")
+
+  userAgent String?  @map("user_agent")
+  ip        String?
+  createdAt DateTime @default(now()) @map("created_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([expiresAt])
+  @@map("refresh_tokens")
+}
+
+model PasswordResetToken {
+  id        String    @id @default(uuid()) @db.Uuid
+  userId    String    @map("user_id") @db.Uuid
+  tokenHash String    @unique @map("token_hash")
+  expiresAt DateTime  @map("expires_at")
+  usedAt    DateTime? @map("used_at")
+  createdAt DateTime  @default(now()) @map("created_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@map("password_reset_tokens")
+}
+
+model Address {
+  id         String  @id @default(uuid()) @db.Uuid
+  userId     String  @map("user_id") @db.Uuid
+  label      String?
+  fullName   String  @map("full_name")
+  line1      String
+  line2      String?
+  city       String
+  region     String?
+  postalCode String  @map("postal_code")
+  country    String  @db.Char(2)
+  phone      String?
+  isDefault  Boolean @default(false) @map("is_default")
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@map("addresses")
+}
+
+// ----------------------------------------------------------------- catalog
+
+model Category {
+  id          String  @id @default(uuid()) @db.Uuid
+  name        String
+  slug        String  @unique
+  description String?
+  parentId    String? @map("parent_id") @db.Uuid
+  position    Int     @default(0)
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  parent   Category?         @relation("CategoryTree", fields: [parentId], references: [id], onDelete: SetNull)
+  children Category[]        @relation("CategoryTree")
+  products ProductCategory[]
+
+  @@index([parentId])
+  @@map("categories")
+}
+
+model Product {
+  id          String  @id @default(uuid()) @db.Uuid
+  sku         String  @unique
+  slug        String  @unique
+  name        String
+  description String  @default("")
+  // Unit price in minor units (cents).
+  priceCents  Int     @map("price_cents")
+  currency    String  @default("USD") @db.Char(3)
+  stockQty    Int     @default(0) @map("stock_qty")
+  isActive    Boolean @default(true) @map("is_active")
+
+  // Maintained by a Postgres trigger (see migration), indexed with GIN.
+  // Prisma cannot read or filter this column directly; full-text queries go
+  // through raw SQL in the catalog repository.
+  searchVector Unsupported("tsvector")? @map("search_vector")
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  images     ProductImage[]
+  categories ProductCategory[]
+  cartItems  CartItem[]
+  orderItems OrderItem[]
+
+  @@index([isActive])
+  @@index([priceCents])
+  @@index([createdAt])
+  @@map("products")
+}
+
+model ProductImage {
+  id        String  @id @default(uuid()) @db.Uuid
+  productId String  @map("product_id") @db.Uuid
+  url       String
+  alt       String  @default("")
+  position  Int     @default(0)
+
+  product Product @relation(fields: [productId], references: [id], onDelete: Cascade)
+
+  @@index([productId])
+  @@map("product_images")
+}
+
+model ProductCategory {
+  productId  String @map("product_id") @db.Uuid
+  categoryId String @map("category_id") @db.Uuid
+
+  product  Product  @relation(fields: [productId], references: [id], onDelete: Cascade)
+  category Category @relation(fields: [categoryId], references: [id], onDelete: Cascade)
+
+  @@id([productId, categoryId])
+  @@index([categoryId])
+  @@map("product_categories")
+}
+
+// -------------------------------------------------------------------- cart
+
+// A cart belongs to either a user (userId set) or an anonymous visitor
+// (sessionToken set). On login the guest cart is merged into the user cart and
+// marked CONVERTED. The partial unique index guaranteeing one ACTIVE cart per
+// user is created in the migration, since Prisma cannot express it.
+model Cart {
+  id           String     @id @default(uuid()) @db.Uuid
+  userId       String?    @map("user_id") @db.Uuid
+  sessionToken String?    @unique @map("session_token")
+  status       CartStatus @default(ACTIVE)
+  expiresAt    DateTime?  @map("expires_at")
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  user  User?      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  items CartItem[]
+
+  @@index([userId])
+  @@index([status, expiresAt])
+  @@map("carts")
+}
+
+// Deliberately stores no price: cart totals are computed from the live product
+// price so that repricing is reflected before checkout. Price is frozen only
+// when an order is created.
+model CartItem {
+  id        String @id @default(uuid()) @db.Uuid
+  cartId    String @map("cart_id") @db.Uuid
+  productId String @map("product_id") @db.Uuid
+  quantity  Int
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  cart    Cart    @relation(fields: [cartId], references: [id], onDelete: Cascade)
+  product Product @relation(fields: [productId], references: [id], onDelete: Cascade)
+
+  @@unique([cartId, productId])
+  @@index([cartId])
+  @@map("cart_items")
+}
+
+// ------------------------------------------------------------------ orders
+
+model Order {
+  id          String      @id @default(uuid()) @db.Uuid
+  orderNumber String      @unique @map("order_number")
+  // Null for guest checkout; `email` is always populated.
+  userId      String?     @map("user_id") @db.Uuid
+  email       String
+  status      OrderStatus @default(PENDING_PAYMENT)
+
+  subtotalCents Int    @map("subtotal_cents")
+  shippingCents Int    @default(0) @map("shipping_cents")
+  taxCents      Int    @default(0) @map("tax_cents")
+  totalCents    Int    @map("total_cents")
+  currency      String @default("USD") @db.Char(3)
+
+  // Immutable snapshots — editing a saved Address must never alter history.
+  shippingAddress Json  @map("shipping_address")
+  billingAddress  Json? @map("billing_address")
+
+  placedAt  DateTime  @default(now()) @map("placed_at")
+  updatedAt DateTime  @updatedAt @map("updated_at")
+  cancelledAt DateTime? @map("cancelled_at")
+
+  user     User?       @relation(fields: [userId], references: [id], onDelete: SetNull)
+  items    OrderItem[]
+  payments Payment[]
+
+  @@index([userId])
+  @@index([status])
+  @@index([placedAt])
+  @@map("orders")
+}
+
+// Product details are denormalized so order history survives product deletion
+// or repricing.
+model OrderItem {
+  id             String  @id @default(uuid()) @db.Uuid
+  orderId        String  @map("order_id") @db.Uuid
+  productId      String? @map("product_id") @db.Uuid
+  productName    String  @map("product_name")
+  sku            String
+  unitPriceCents Int     @map("unit_price_cents")
+  quantity       Int
+  lineTotalCents Int     @map("line_total_cents")
+
+  order   Order    @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  product Product? @relation(fields: [productId], references: [id], onDelete: SetNull)
+
+  @@index([orderId])
+  @@map("order_items")
+}
+
+model Payment {
+  id          String        @id @default(uuid()) @db.Uuid
+  orderId     String        @map("order_id") @db.Uuid
+  provider    String        @default("mock")
+  providerRef String?       @map("provider_ref")
+  amountCents Int           @map("amount_cents")
+  currency    String        @default("USD") @db.Char(3)
+  status      PaymentStatus @default(PENDING)
+  failureCode String?       @map("failure_code")
+  rawResponse Json?         @map("raw_response")
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  order Order @relation(fields: [orderId], references: [id], onDelete: Cascade)
+
+  @@index([orderId])
+  @@map("payments")
+}

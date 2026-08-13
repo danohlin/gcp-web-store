@@ -1,0 +1,106 @@
+name: web-store
+
+# Local development stack: Postgres, a one-shot migrate+seed job, the API, and
+# the nginx-served frontend. `docker compose up --build` gives a working store
+# on http://localhost:8080 with no host toolchain beyond Docker.
+#
+# The credentials below are local-only. Nothing here is used in AWS, where
+# Terraform generates the secrets and the Secrets Store CSI driver mounts them.
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    container_name: web-store-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: webstore
+      POSTGRES_PASSWORD: webstore
+      POSTGRES_DB: webstore
+    ports:
+      - '5432:5432'
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./scripts/postgres-init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U webstore -d webstore']
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
+  # Runs to completion before the API starts. Uses the same image as the API,
+  # so the migrations always match the code being deployed — the same guarantee
+  # the Helm pre-upgrade hook provides in EKS.
+  migrate:
+    build:
+      context: ./backend
+      target: migrator
+    image: web-store-migrator:local
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://webstore:webstore@postgres:5432/webstore?schema=public
+      SEED_ADMIN_PASSWORD: ChangeMe-Admin-123
+      SEED_CUSTOMER_PASSWORD: ChangeMe-Customer-123
+    command: >
+      sh -c "npx prisma migrate deploy && node dist/seed.js"
+    restart: 'no'
+
+  backend:
+    build:
+      context: ./backend
+      target: runtime
+    image: web-store-backend:local
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    environment:
+      NODE_ENV: production
+      PORT: '4000'
+      LOG_LEVEL: info
+      DATABASE_URL: postgresql://webstore:webstore@postgres:5432/webstore?schema=public
+      JWT_ACCESS_SECRET: local-compose-access-secret-not-for-aws
+      JWT_REFRESH_SECRET: local-compose-refresh-secret-not-for-aws
+      # Same-origin through nginx, so no cross-origin allowance is needed.
+      CORS_ORIGINS: ''
+      COOKIE_SECURE: 'false'
+      TRUST_PROXY: 'true'
+    expose:
+      - '4000'
+    ports:
+      # Exposed for direct API poking; the app itself goes through nginx.
+      - '4000:4000'
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - "fetch('http://127.0.0.1:4000/readyz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 15s
+
+  frontend:
+    build:
+      context: ./frontend
+    image: web-store-frontend:local
+    restart: unless-stopped
+    depends_on:
+      backend:
+        condition: service_healthy
+    environment:
+      BACKEND_ORIGIN: http://backend:4000
+    ports:
+      - '8080:8080'
+    healthcheck:
+      test: ['CMD', 'wget', '-qO-', 'http://127.0.0.1:8080/healthz']
+      interval: 10s
+      timeout: 5s
+      retries: 6
+
+volumes:
+  pgdata:

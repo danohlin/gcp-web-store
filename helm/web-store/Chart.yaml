@@ -1,0 +1,12 @@
+apiVersion: v2
+name: web-store
+description: Storefront API and SPA for Amazon EKS, fronted by an ALB.
+type: application
+
+# Chart version is bumped by hand; appVersion tracks the container image tag and
+# is overridden by CI at deploy time.
+version: 0.1.0
+appVersion: '0.1.0'
+
+maintainers:
+  - name: danohlin

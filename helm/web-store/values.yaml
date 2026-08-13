@@ -1,0 +1,127 @@
+# Defaults. Environment overlays live alongside as values-<env>.yaml, and CI
+# supplies the image tags at deploy time.
+#
+# There are no secrets in this file, and there must never be any. Everything
+# sensitive is pulled from AWS Secrets Manager by the Secrets Store CSI driver
+# and mounted as files; see `secrets` below.
+
+nameOverride: ''
+fullnameOverride: ''
+
+# --------------------------------------------------------------------- images
+# `repository` is the ECR URI, filled in from Terraform output.
+# `tag` has no default on purpose: the chart fails rather than deploy a
+# floating tag, because a mutable tag makes a rollback meaningless.
+backend:
+  image:
+    repository: ''
+    tag: ''
+    pullPolicy: IfNotPresent
+  replicaCount: 2
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      # No CPU limit: throttling a Node process hurts tail latency far more
+      # than it protects neighbours, and the memory limit is the real guard.
+      memory: 512Mi
+  autoscaling:
+    enabled: true
+    minReplicas: 2
+    maxReplicas: 6
+    targetCPUUtilizationPercentage: 70
+
+frontend:
+  image:
+    repository: ''
+    tag: ''
+    pullPolicy: IfNotPresent
+  replicaCount: 2
+  resources:
+    requests:
+      cpu: 25m
+      memory: 64Mi
+    limits:
+      memory: 128Mi
+  autoscaling:
+    enabled: false
+    minReplicas: 2
+    maxReplicas: 4
+    targetCPUUtilizationPercentage: 75
+
+# ---------------------------------------------------------------- application
+app:
+  logLevel: info
+  # Behind an ALB the client address arrives in X-Forwarded-For; without this
+  # rate limiting would bucket every request under the load balancer.
+  trustProxy: true
+  # Requires HTTPS. Left false until a certificate is configured, otherwise the
+  # browser silently drops the refresh cookie and nobody can stay signed in.
+  cookieSecure: false
+  # Empty means same-origin only, which is correct when the ALB serves the SPA
+  # and the API on one hostname.
+  corsOrigins: ''
+  shippingFlatCents: 599
+  freeShippingThresholdCents: 5000
+  taxRateBasisPoints: 875
+
+# -------------------------------------------------------------------- secrets
+# Mounted as files under `mountPath`; the backend reads them via SECRETS_DIR and
+# never receives them as environment variables, so they stay out of manifests,
+# `kubectl describe pod`, and any child process environment.
+secrets:
+  enabled: true
+  mountPath: /mnt/secrets
+  region: us-east-1
+  # Secrets Manager names, supplied by Terraform.
+  databaseSecretName: ''
+  appSecretName: ''
+
+serviceAccount:
+  create: true
+  name: ''
+  # IRSA role ARN, from Terraform. Grants secretsmanager:GetSecretValue.
+  roleArn: ''
+
+# ------------------------------------------------------------------ migration
+# Runs as a Helm pre-install/pre-upgrade hook, so the schema is in place before
+# any new pod serves traffic. Uses the migrator image, which is built from the
+# same commit as the API.
+migration:
+  enabled: true
+  image:
+    repository: ''
+    tag: ''
+  # Reseeds on every deploy. Correct for a throwaway environment that is
+  # destroyed nightly; must be false anywhere with real data.
+  seed: true
+  backoffLimit: 2
+  activeDeadlineSeconds: 600
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      memory: 512Mi
+
+# -------------------------------------------------------------------- ingress
+ingress:
+  enabled: true
+  className: alb
+  # Set to serve HTTPS. Without it the ALB listens on port 80 only and
+  # app.cookieSecure must stay false.
+  certificateArn: ''
+  host: ''
+  annotations: {}
+
+# ---------------------------------------------------------------- scheduling
+podDisruptionBudget:
+  enabled: true
+  minAvailable: 1
+
+nodeSelector: {}
+tolerations: []
+# Spread replicas across nodes where possible, but do not block scheduling on a
+# small node group.
+podAntiAffinity: preferred

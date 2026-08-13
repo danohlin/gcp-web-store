@@ -1,0 +1,11 @@
+# Copy to terraform.tfvars and adjust if needed. Real .tfvars files are ignored
+# by git and blocked by the pre-commit hook.
+#
+# Note there is no account id here: it is read from your AWS credentials via
+# aws_caller_identity, so it never lands in the repository.
+
+project = "web-store"
+region  = "us-east-1"
+
+# Tagged images kept per repository before the oldest are expired.
+image_retention_count = 10

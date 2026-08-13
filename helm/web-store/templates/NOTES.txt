@@ -1,0 +1,44 @@
+{{ .Chart.Name }} {{ .Chart.AppVersion }} deployed as release "{{ .Release.Name }}".
+
+{{- if .Values.ingress.enabled }}
+
+The AWS Load Balancer Controller provisions the ALB out of band, so the address
+takes a minute or two to appear:
+
+  kubectl get ingress {{ include "web-store.fullname" . }} -n {{ .Release.Namespace }} -w
+
+Then open:
+{{- if .Values.ingress.host }}
+  http{{ if .Values.ingress.certificateArn }}s{{ end }}://{{ .Values.ingress.host }}
+{{- else }}
+  http://<the ADDRESS shown above>
+{{- end }}
+{{- end }}
+
+{{- if not .Values.ingress.certificateArn }}
+
+NOTE: no certificate is configured, so traffic is plain HTTP and
+app.cookieSecure is {{ .Values.app.cookieSecure }}. Do not set cookieSecure=true
+without TLS — the browser would drop the refresh cookie and nobody could stay
+signed in.
+{{- end }}
+
+{{- if .Values.migration.seed }}
+
+WARNING: migration.seed is true, so every deploy reseeds the catalogue and
+resets the demo account passwords. Correct for a throwaway environment, wrong
+anywhere holding real data.
+{{- end }}
+
+Check rollout status:
+  kubectl rollout status deploy/{{ include "web-store.fullname" . }}-backend -n {{ .Release.Namespace }}
+  kubectl rollout status deploy/{{ include "web-store.fullname" . }}-frontend -n {{ .Release.Namespace }}
+
+IMPORTANT — teardown order. The ALB and its security groups are created by the
+controller, not by Terraform. Deleting the cluster or VPC first strands network
+interfaces that block the VPC from being destroyed, and `terraform destroy`
+then hangs for ~20 minutes before failing. Always remove this release and wait
+for the ALB to disappear before destroying infrastructure:
+
+  helm uninstall {{ .Release.Name }} -n {{ .Release.Namespace }}
+  kubectl wait --for=delete ingress/{{ include "web-store.fullname" . }} -n {{ .Release.Namespace }} --timeout=5m

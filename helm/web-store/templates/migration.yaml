@@ -1,0 +1,166 @@
+{{- if .Values.migration.enabled }}
+{{/*
+Schema migrations run as a pre-install/pre-upgrade hook, so the database is
+ready before any new pod serves traffic.
+
+Helm applies hooks before the release's normal resources, which means this Job
+cannot use the ServiceAccount or SecretProviderClass defined elsewhere in the
+chart — they do not exist yet on a first install. The hook therefore carries
+its own copies at a lower weight. They are left in place on failure so the Job
+can be inspected, and replaced on the next run.
+*/}}
+{{- $name := printf "%s-migrate" (include "web-store.fullname" .) -}}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "web-store.labels" . | nindent 4 }}
+    app.kubernetes.io/component: migrate
+  annotations:
+    helm.sh/hook: pre-install,pre-upgrade
+    helm.sh/hook-weight: '-10'
+    helm.sh/hook-delete-policy: before-hook-creation
+    {{- if .Values.serviceAccount.roleArn }}
+    eks.amazonaws.com/role-arn: {{ .Values.serviceAccount.roleArn | quote }}
+    {{- end }}
+{{- if .Values.secrets.enabled }}
+---
+apiVersion: secrets-store.csi.x-k8s.io/v1
+kind: SecretProviderClass
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "web-store.labels" . | nindent 4 }}
+    app.kubernetes.io/component: migrate
+  annotations:
+    helm.sh/hook: pre-install,pre-upgrade
+    helm.sh/hook-weight: '-10'
+    helm.sh/hook-delete-policy: before-hook-creation
+spec:
+  provider: aws
+  parameters:
+    region: {{ .Values.secrets.region | quote }}
+    objects: |
+      - objectName: {{ .Values.secrets.databaseSecretName | quote }}
+        objectType: secretsmanager
+        jmesPath:
+          - path: username
+            objectAlias: DB_USER
+          - path: password
+            objectAlias: DB_PASSWORD
+          - path: host
+            objectAlias: DB_HOST
+          - path: to_string(port)
+            objectAlias: DB_PORT
+          - path: dbname
+            objectAlias: DB_NAME
+      - objectName: {{ .Values.secrets.appSecretName | quote }}
+        objectType: secretsmanager
+        jmesPath:
+          - path: seedAdminPassword
+            objectAlias: SEED_ADMIN_PASSWORD
+          - path: seedCustomerPassword
+            objectAlias: SEED_CUSTOMER_PASSWORD
+{{- end }}
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "web-store.labels" . | nindent 4 }}
+    app.kubernetes.io/component: migrate
+  annotations:
+    helm.sh/hook: pre-install,pre-upgrade
+    helm.sh/hook-weight: '-5'
+    # Removed once it succeeds; a failed Job is kept so its logs can be read.
+    helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded
+spec:
+  backoffLimit: {{ .Values.migration.backoffLimit }}
+  activeDeadlineSeconds: {{ .Values.migration.activeDeadlineSeconds }}
+  template:
+    metadata:
+      labels:
+        {{- include "web-store.labels" . | nindent 8 }}
+        app.kubernetes.io/component: migrate
+    spec:
+      restartPolicy: Never
+      serviceAccountName: {{ $name }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      {{- with .Values.nodeSelector }}
+      nodeSelector: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: migrate
+          image: {{ include "web-store.image" .Values.migration.image }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ['ALL']
+          command: ['/bin/sh', '-c']
+          args:
+            - |
+              set -eu
+
+              {{- if .Values.secrets.enabled }}
+              SECRETS={{ .Values.secrets.mountPath }}
+
+              # The Prisma CLI only accepts a DATABASE_URL, so the connection
+              # string is assembled here from the individual mounted files.
+              # Terraform generates the password from an alphanumeric alphabet
+              # specifically so it needs no percent-encoding at this point.
+              DB_USER=$(cat "$SECRETS/DB_USER")
+              DB_PASSWORD=$(cat "$SECRETS/DB_PASSWORD")
+              DB_HOST=$(cat "$SECRETS/DB_HOST")
+              DB_PORT=$(cat "$SECRETS/DB_PORT")
+              DB_NAME=$(cat "$SECRETS/DB_NAME")
+              export DATABASE_URL="postgresql://${DB_USER}:${DB_PASSWORD}@${DB_HOST}:${DB_PORT}/${DB_NAME}?schema=public&sslmode=require"
+              {{- end }}
+
+              echo "Applying migrations..."
+              npx prisma migrate deploy
+
+              {{- if .Values.migration.seed }}
+              {{- if .Values.secrets.enabled }}
+              SEED_ADMIN_PASSWORD=$(cat "$SECRETS/SEED_ADMIN_PASSWORD")
+              SEED_CUSTOMER_PASSWORD=$(cat "$SECRETS/SEED_CUSTOMER_PASSWORD")
+              export SEED_ADMIN_PASSWORD SEED_CUSTOMER_PASSWORD
+              {{- end }}
+              echo "Seeding..."
+              node dist/seed.js
+              {{- end }}
+
+              echo "Migration job complete."
+          resources:
+            {{- toYaml .Values.migration.resources | nindent 12 }}
+          volumeMounts:
+            {{- if .Values.secrets.enabled }}
+            - name: secrets
+              mountPath: {{ .Values.secrets.mountPath }}
+              readOnly: true
+            {{- end }}
+            # Prisma writes to a temporary directory while applying migrations.
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        {{- if .Values.secrets.enabled }}
+        - name: secrets
+          csi:
+            driver: secrets-store.csi.k8s.io
+            readOnly: true
+            volumeAttributes:
+              secretProviderClass: {{ $name }}
+        {{- end }}
+        - name: tmp
+          emptyDir: {}
+{{- end }}

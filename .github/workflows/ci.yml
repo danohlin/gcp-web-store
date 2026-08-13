@@ -1,0 +1,191 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+# No AWS access anywhere in this workflow. It builds and tests only, so a pull
+# request from a fork can never reach the cloud account.
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  secrets:
+    name: Secret scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Full history: the local pre-commit hook only sees staged changes and
+          # can be bypassed with --no-verify, so CI checks every commit.
+          fetch-depth: 0
+
+      - name: gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  backend:
+    name: Backend
+    runs-on: ubuntu-latest
+
+    # Integration tests run against a real Postgres rather than a mock, because
+    # the parts most worth testing — the tsvector triggers, the conditional
+    # stock decrement, the partial unique index — only exist in the database.
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: webstore
+          POSTGRES_PASSWORD: webstore
+          POSTGRES_DB: webstore_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U webstore"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+
+    defaults:
+      run:
+        working-directory: backend
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: backend/package-lock.json
+
+      - run: npm ci
+
+      - name: Generate Prisma client
+        run: npx prisma generate
+
+      - run: npm run typecheck
+      - run: npm run lint
+
+      - name: Test
+        run: npm test
+        env:
+          DATABASE_URL: postgresql://webstore:webstore@localhost:5432/webstore_test?schema=public
+
+      - run: npm run build
+
+  frontend:
+    name: Frontend
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm run lint
+      - run: npm test
+      - run: npm run build
+
+  images:
+    name: Container builds
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      # Built but not pushed. This catches a broken Dockerfile on a pull
+      # request, without needing any credentials.
+      - name: Build backend runtime
+        uses: docker/build-push-action@v6
+        with:
+          context: ./backend
+          target: runtime
+          push: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Build migrator
+        uses: docker/build-push-action@v6
+        with:
+          context: ./backend
+          target: migrator
+          push: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Build frontend
+        uses: docker/build-push-action@v6
+        with:
+          context: ./frontend
+          push: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  manifests:
+    name: Charts and Terraform
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: azure/setup-helm@v4
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.10.5
+
+      - name: helm lint
+        run: |
+          helm lint helm/web-store \
+            --set backend.image.repository=example --set backend.image.tag=ci \
+            --set frontend.image.repository=example --set frontend.image.tag=ci \
+            --set migration.image.repository=example --set migration.image.tag=ci \
+            --set secrets.databaseSecretName=db --set secrets.appSecretName=app
+
+      - name: Render chart
+        run: |
+          helm template web-store helm/web-store \
+            -f helm/web-store/values-dev.yaml \
+            --set backend.image.repository=example --set backend.image.tag=ci \
+            --set frontend.image.repository=example --set frontend.image.tag=ci \
+            --set migration.image.repository=example --set migration.image.tag=ci \
+            --set secrets.databaseSecretName=db --set secrets.appSecretName=app \
+            > /tmp/rendered.yaml
+
+      - name: Validate manifests against the Kubernetes schemas
+        run: |
+          curl -sSL -o /tmp/kubeconform.tar.gz \
+            https://github.com/yannh/kubeconform/releases/download/v0.6.7/kubeconform-linux-amd64.tar.gz
+          tar -xzf /tmp/kubeconform.tar.gz -C /tmp
+          # SecretProviderClass is a CRD with no published schema, hence
+          # ignore-missing-schemas; everything else is checked strictly.
+          # Keep in step with kubernetes_version in infra/ephemeral/variables.tf,
+          # so the manifests are checked against the API the cluster actually runs.
+          /tmp/kubeconform -strict -summary -ignore-missing-schemas \
+            -kubernetes-version 1.36.0 /tmp/rendered.yaml
+
+      - name: terraform fmt
+        run: terraform fmt -check -recursive infra/
+
+      - name: terraform validate
+        run: |
+          for dir in infra/persistent infra/ephemeral; do
+            echo "--- $dir"
+            terraform -chdir="$dir" init -backend=false -input=false > /dev/null
+            terraform -chdir="$dir" validate
+          done

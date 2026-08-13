@@ -1,0 +1,180 @@
+name: Deploy
+
+# Only from main, matching the OIDC trust policy. A run from any other ref
+# cannot assume the role, so this would fail at the credentials step.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Environment to deploy
+        required: false
+        default: dev
+
+permissions:
+  # Required for GitHub to mint the OIDC token. Without it the credentials
+  # step fails with "Could not load OIDC token".
+  id-token: write
+  contents: read
+
+concurrency:
+  # Never let two deploys race for the same cluster; queue instead of cancelling
+  # so a half-applied release is not abandoned mid-rollout.
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: us-east-1
+  PROJECT: web-store
+  ENVIRONMENT: ${{ inputs.environment || 'dev' }}
+
+jobs:
+  deploy:
+    name: Build and deploy
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # No access keys anywhere. GitHub mints a short-lived token, AWS trades it
+      # for temporary credentials, and they expire when the job ends.
+      - name: Assume the deploy role
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: gha-${{ github.run_id }}
+
+      - name: Resolve names
+        id: names
+        run: |
+          set -euo pipefail
+          ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
+          REGISTRY="${ACCOUNT}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+          # Every name is derived from the naming convention rather than read
+          # from Terraform state. CI therefore needs no access to that state,
+          # which holds the database password in plaintext.
+          {
+            echo "registry=${REGISTRY}"
+            echo "cluster=${PROJECT}-${ENVIRONMENT}"
+            echo "namespace=${PROJECT}"
+            echo "db_secret=${PROJECT}/${ENVIRONMENT}/db"
+            echo "app_secret=${PROJECT}/${ENVIRONMENT}/app"
+            echo "app_role=arn:aws:iam::${ACCOUNT}:role/${PROJECT}-${ENVIRONMENT}-app"
+            echo "tag=${GITHUB_SHA::7}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Log in to ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build and push backend
+        uses: docker/build-push-action@v6
+        with:
+          context: ./backend
+          target: runtime
+          push: true
+          # See scripts/up.ps1 for why attestations are off.
+          provenance: false
+          tags: ${{ steps.names.outputs.registry }}/${{ env.PROJECT }}/backend:${{ steps.names.outputs.tag }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Build and push migrator
+        uses: docker/build-push-action@v6
+        with:
+          context: ./backend
+          target: migrator
+          push: true
+          # See scripts/up.ps1 for why attestations are off.
+          provenance: false
+          tags: ${{ steps.names.outputs.registry }}/${{ env.PROJECT }}/migrator:${{ steps.names.outputs.tag }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Build and push frontend
+        uses: docker/build-push-action@v6
+        with:
+          context: ./frontend
+          push: true
+          # See scripts/up.ps1 for why attestations are off.
+          provenance: false
+          tags: ${{ steps.names.outputs.registry }}/${{ env.PROJECT }}/frontend:${{ steps.names.outputs.tag }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # The environment is torn down nightly, so a deploy may well find no
+      # cluster. That is expected, not a failure: the images are pushed and
+      # waiting for the next `up.ps1`.
+      - name: Is the cluster up?
+        id: cluster
+        run: |
+          if aws eks describe-cluster --name "${{ steps.names.outputs.cluster }}" \
+               --region "$AWS_REGION" >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::Cluster ${{ steps.names.outputs.cluster }} is not running. Images pushed; skipping deploy."
+          fi
+
+      - uses: azure/setup-helm@v4
+        if: steps.cluster.outputs.exists == 'true'
+
+      - name: Configure kubectl
+        if: steps.cluster.outputs.exists == 'true'
+        run: |
+          aws eks update-kubeconfig \
+            --name "${{ steps.names.outputs.cluster }}" \
+            --region "$AWS_REGION"
+
+      - name: Deploy
+        if: steps.cluster.outputs.exists == 'true'
+        run: |
+          set -euo pipefail
+          helm upgrade --install "$PROJECT" ./helm/web-store \
+            --namespace "${{ steps.names.outputs.namespace }}" \
+            --create-namespace \
+            -f ./helm/web-store/values-dev.yaml \
+            --set "backend.image.repository=${{ steps.names.outputs.registry }}/${PROJECT}/backend" \
+            --set backend.image.tag=${{ steps.names.outputs.tag }} \
+            --set "frontend.image.repository=${{ steps.names.outputs.registry }}/${PROJECT}/frontend" \
+            --set frontend.image.tag=${{ steps.names.outputs.tag }} \
+            --set "migration.image.repository=${{ steps.names.outputs.registry }}/${PROJECT}/migrator" \
+            --set migration.image.tag=${{ steps.names.outputs.tag }} \
+            --set secrets.region="$AWS_REGION" \
+            --set secrets.databaseSecretName=${{ steps.names.outputs.db_secret }} \
+            --set secrets.appSecretName=${{ steps.names.outputs.app_secret }} \
+            --set serviceAccount.roleArn=${{ steps.names.outputs.app_role }} \
+            --wait --timeout 10m
+
+      # The migration hook runs before the pods roll, so when a deploy fails it
+      # is usually the Job that explains why. Surface it rather than making
+      # someone go and find it.
+      - name: Migration logs on failure
+        if: failure() && steps.cluster.outputs.exists == 'true'
+        run: |
+          kubectl logs -n "${{ steps.names.outputs.namespace }}" \
+            -l app.kubernetes.io/component=migrate --tail=100 || true
+          kubectl get pods -n "${{ steps.names.outputs.namespace }}" || true
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "### Deploy"
+            echo ""
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Tag | \`${{ steps.names.outputs.tag }}\` |"
+            echo "| Cluster | \`${{ steps.names.outputs.cluster }}\` |"
+            if [ "${{ steps.cluster.outputs.exists }}" = "true" ]; then
+              ADDR=$(kubectl get ingress "$PROJECT" -n "${{ steps.names.outputs.namespace }}" \
+                     -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || echo "pending")
+              echo "| URL | http://${ADDR} |"
+            else
+              echo "| Status | Cluster down - images pushed, deploy skipped |"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+

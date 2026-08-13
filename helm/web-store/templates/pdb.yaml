@@ -1,0 +1,32 @@
+{{- if .Values.podDisruptionBudget.enabled }}
+{{/*
+Keeps at least one replica of each component during voluntary disruption, such
+as a node drain. Note that minAvailable must stay below the replica count, or
+the drain blocks forever.
+*/}}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "web-store.fullname" . }}-backend
+  labels:
+    {{- include "web-store.labels" . | nindent 4 }}
+    app.kubernetes.io/component: backend
+spec:
+  minAvailable: {{ .Values.podDisruptionBudget.minAvailable }}
+  selector:
+    matchLabels:
+      {{- include "web-store.selectorLabels" (dict "root" . "component" "backend") | nindent 6 }}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "web-store.fullname" . }}-frontend
+  labels:
+    {{- include "web-store.labels" . | nindent 4 }}
+    app.kubernetes.io/component: frontend
+spec:
+  minAvailable: {{ .Values.podDisruptionBudget.minAvailable }}
+  selector:
+    matchLabels:
+      {{- include "web-store.selectorLabels" (dict "root" . "component" "frontend") | nindent 6 }}
+{{- end }}

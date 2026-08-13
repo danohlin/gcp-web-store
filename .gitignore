@@ -1,12 +1,72 @@
-# --- Cloud credentials -------------------------------------------------------
-# Service-account keys and ADC caches: live credentials, never belong in git.
+# --- Node / Backend ---
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+dist/
+build/
+coverage/
+*.tsbuildinfo
+
+# --- React / Frontend (Vite/CRA) ---
+frontend/dist/
+frontend/build/
+frontend/.vite/
+
+# --- Environment / Secrets ---
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# --- Docker ---
+*.log
+docker-compose.override.yml
+
+# --- Terraform ---
+**/.terraform/*
+# State holds every secret in plaintext, including generated DB passwords.
+*.tfstate
+*.tfstate.*
+*.tfvars
+*.tfvars.json
+!*.tfvars.example
+crash.log
+crash.*.log
+.terraformrc
+terraform.rc
+# NOTE: .terraform.lock.hcl is deliberately NOT ignored. It pins provider
+# versions and hashes, and committing it is what makes an apply reproducible.
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+tfplan
+*.tfplan
+# Backend configs name the state bucket, which embeds the AWS account id.
+backend.hcl
+!backend.hcl.example
+
+# --- Cloud / cluster credentials ---
+.aws/
+credentials
+*.kubeconfig
+kubeconfig
+kubeconfig-*
+*.retry
+
+# --- GCP credentials ---
+# Service-account keys: live credentials, never belong in git.
 *-service-account*.json
 *-sa-key*.json
 service-account*.json
 gcp-key*.json
-# ADC caches: the .json holds a long-lived OAuth refresh token, the .db files
-# cache CLI tokens. Normally in $HOME, but land in-tree via CLOUDSDK_CONFIG,
-# devcontainers, or `gcloud auth ... login` run inside a mounted workspace.
+# ADC caches. The .json holds a long-lived OAuth refresh token, not a
+# short-lived access token, and carries the user's full IAM reach. Normally in
+# $HOME, but lands in-tree via CLOUDSDK_CONFIG, devcontainers, or running
+# `gcloud auth application-default login` inside a mounted workspace.
 application_default_credentials.json*
 credentials.db
 access_tokens.db
@@ -14,65 +74,18 @@ legacy_credentials/
 .gcloud/
 .config/gcloud/
 
-# --- Environment / secrets ---------------------------------------------------
-# Real values stay local; commit the .example counterparts instead.
-.env
-.env.*
-!.env.example
-*.pem
-*.key
-!*.pub
+# --- Kubernetes / Helm ---
+*.kubeconfig
+charts/*/charts/
+charts/*/Chart.lock
 
-# --- Terraform / OpenTofu ----------------------------------------------------
-# State can contain plaintext secrets; plans and .terraform/ are generated.
-*.tfstate
-*.tfstate.*
-.terraform/
-.terraform.lock.hcl.bak
-*.tfplan
-*.tfplan.*
-crash.log
-crash.*.log
-override.tf
-override.tf.json
-*_override.tf
-*_override.tf.json
-*.tfvars
-*.tfvars.json
-!*.tfvars.example
-
-# --- Node --------------------------------------------------------------------
-node_modules/
-dist/
-build/
-.next/
-.nuxt/
-out/
-coverage/
-*.tsbuildinfo
-npm-debug.log*
-yarn-error.log*
-pnpm-debug.log*
-
-# --- Python ------------------------------------------------------------------
-__pycache__/
-*.py[cod]
-.venv/
-venv/
-*.egg-info/
-.pytest_cache/
-.mypy_cache/
-.ruff_cache/
-
-# --- App Engine / Cloud Functions build artifacts ----------------------------
-.gcloudignore.bak
-lib/
-appengine-generated/
-
-# --- Editors / OS ------------------------------------------------------------
+# --- OS / Editor ---
+.DS_Store
+Thumbs.db
 .vscode/*
 !.vscode/extensions.json
 .idea/
-*.swp
-.DS_Store
-Thumbs.db
+
+# --- Misc ---
+*.tmp
+*.bak

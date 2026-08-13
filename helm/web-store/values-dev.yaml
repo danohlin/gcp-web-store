@@ -1,0 +1,44 @@
+# Throwaway environment: created in the morning, destroyed at the end of the
+# day. Sized down accordingly, and reseeded on every deploy.
+#
+# Repositories, secret names and the IRSA role ARN come from Terraform outputs;
+# the up script fills them in. Image tags come from CI.
+
+backend:
+  replicaCount: 1
+  autoscaling:
+    enabled: false
+  resources:
+    requests:
+      cpu: 50m
+      memory: 192Mi
+    limits:
+      memory: 384Mi
+
+frontend:
+  replicaCount: 1
+  autoscaling:
+    enabled: false
+  resources:
+    requests:
+      cpu: 10m
+      memory: 32Mi
+    limits:
+      memory: 96Mi
+
+app:
+  logLevel: debug
+  # No certificate on the ALB's default hostname, so cookies cannot be Secure.
+  cookieSecure: false
+
+migration:
+  seed: true
+
+# A single replica cannot satisfy minAvailable: 1 and still be evictable, which
+# would block node drains and stall a teardown.
+podDisruptionBudget:
+  enabled: false
+
+# No tolerations needed: the node group carries no taint. See the comment in
+# infra/ephemeral/eks.tf for why the spot taint was removed.
+tolerations: []
