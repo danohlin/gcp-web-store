@@ -1,0 +1,9 @@
+# Shell scripts must check out with LF regardless of core.autocrlf. A CRLF
+# shebang line makes the kernel look for an interpreter named "sh\r", which
+# fails with a confusing "bad interpreter" error.
+.githooks/** text eol=lf
+*.sh        text eol=lf
+
+# YAML is parsed by Linux runners; keep it LF for the same reason.
+*.yml       text eol=lf
+*.yaml      text eol=lf

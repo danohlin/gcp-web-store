@@ -1,0 +1,39 @@
+#!/usr/bin/env sh
+#
+# Block commits containing credential material.
+#
+# Scans the staged diff (content, not just filenames) with gitleaks. Enabled by
+# `git config core.hooksPath .githooks` -- run that once per clone, since git
+# does not apply repo config automatically.
+#
+# A missing gitleaks is a hard failure, not a silent skip: a gate that quietly
+# stops gating is worse than no gate. Install it, or pass --no-verify knowing
+# you are committing unscanned.
+
+set -e
+
+if ! command -v gitleaks >/dev/null 2>&1; then
+	echo "pre-commit: gitleaks not found on PATH." >&2
+	echo "  install:  winget install gitleaks   (or: brew install gitleaks)" >&2
+	echo "  commit is blocked rather than scanned silently." >&2
+	exit 1
+fi
+
+# Nothing staged (e.g. `git commit --amend` with no changes) -- nothing to scan.
+if git diff --cached --quiet; then
+	exit 0
+fi
+
+if ! git diff --cached | gitleaks stdin --redact --verbose; then
+	echo "" >&2
+	echo "pre-commit: gitleaks flagged the staged changes. Commit blocked." >&2
+	echo "" >&2
+	echo "  Findings are redacted above. If a real credential is involved," >&2
+	echo "  rotate or revoke it first -- unstaging is not remediation." >&2
+	echo "" >&2
+	echo "  False positive? Add a narrow rule to .gitleaks.toml, or append" >&2
+	echo "  the gitleaks:allow comment to the offending line." >&2
+	exit 1
+fi
+
+exit 0
