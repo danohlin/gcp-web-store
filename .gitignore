@@ -1,0 +1,72 @@
+# --- Cloud credentials -------------------------------------------------------
+# Service-account keys and ADC caches: live credentials, never belong in git.
+*-service-account*.json
+*-sa-key*.json
+service-account*.json
+gcp-key*.json
+application_default_credentials.json
+.gcloud/
+.config/gcloud/
+
+# --- Environment / secrets ---------------------------------------------------
+# Real values stay local; commit the .example counterparts instead.
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+!*.pub
+
+# --- Terraform / OpenTofu ----------------------------------------------------
+# State can contain plaintext secrets; plans and .terraform/ are generated.
+*.tfstate
+*.tfstate.*
+.terraform/
+.terraform.lock.hcl.bak
+*.tfplan
+*.tfplan.*
+crash.log
+crash.*.log
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+*.tfvars
+*.tfvars.json
+!*.tfvars.example
+
+# --- Node --------------------------------------------------------------------
+node_modules/
+dist/
+build/
+.next/
+.nuxt/
+out/
+coverage/
+*.tsbuildinfo
+npm-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# --- Python ------------------------------------------------------------------
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# --- App Engine / Cloud Functions build artifacts ----------------------------
+.gcloudignore.bak
+lib/
+appengine-generated/
+
+# --- Editors / OS ------------------------------------------------------------
+.vscode/*
+!.vscode/extensions.json
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
