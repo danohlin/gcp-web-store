@@ -4,7 +4,13 @@
 *-sa-key*.json
 service-account*.json
 gcp-key*.json
-application_default_credentials.json
+# ADC caches: the .json holds a long-lived OAuth refresh token, the .db files
+# cache CLI tokens. Normally in $HOME, but land in-tree via CLOUDSDK_CONFIG,
+# devcontainers, or `gcloud auth ... login` run inside a mounted workspace.
+application_default_credentials.json*
+credentials.db
+access_tokens.db
+legacy_credentials/
 .gcloud/
 .config/gcloud/
 
