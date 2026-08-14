@@ -56,9 +56,18 @@ podDisruptionBudget:
 # Autopilot manages system workloads itself, so the CoreDNS-stuck-Pending
 # failure that forced the spot taint out of the EKS stack has no counterpart
 # here and no toleration is needed. What does carry over is the eviction
-# window: Spot Pods get 25 seconds' notice against a
-# terminationGracePeriodSeconds of 30, so a pod can be killed part-way through
-# draining.
+# window: Spot Pods get 25 seconds' notice.
+#
+# Setting this selector also silently shortens the grace period. Autopilot
+# caps terminationGracePeriodSeconds at 25 for any pod tolerating Spot and
+# rewrites anything higher on admission, so the 30 the Deployments ask for
+# never takes effect here. Verified on a real cluster — the admitted pods
+# report 25 — and announced only as an admission warning in the helm output,
+# which scrolls past.
+#
+# It costs nothing today because the server force-exits at 15s regardless. It
+# would start to matter if shutdown ever grew slower than 25 seconds, and the
+# symptom would be pods killed mid-drain with the manifest still claiming 30.
 nodeSelector:
   cloud.google.com/gke-spot: 'true'
 

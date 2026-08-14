@@ -15,6 +15,20 @@ metadata:
     # matches no controller at all. The Ingress is then accepted by the API
     # server, passes schema validation, and simply sits there: no address, and
     # no events to say why, because no controller ever looked at it.
+    #
+    # Applying this emits an admission warning saying the annotation is
+    # deprecated and to use spec.ingressClassName instead:
+    #
+    #   Warning: annotation "kubernetes.io/ingress.class" is deprecated,
+    #   please use 'spec.ingressClassName' instead
+    #
+    # Ignore it. That is generic upstream advice, and upstream assumes a
+    # controller ships an IngressClass; GKE's does not. Re-verified against
+    # GKE 1.35 Autopilot: `kubectl get ingressclass` still returns "No
+    # resources found", so following the warning reintroduces the silent
+    # failure above — an Ingress that never gets an address and reports
+    # nothing wrong. Do not act on this warning without first confirming an
+    # IngressClass named gce actually exists on the cluster.
     kubernetes.io/ingress.class: {{ .Values.ingress.className | quote }}
     # The controller provisions an external Application Load Balancer out of
     # band. Nothing in Terraform knows about it, which is why the teardown

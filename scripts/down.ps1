@@ -1,3 +1,11 @@
+# PowerShell 7+, not Windows PowerShell 5.1 — see the note in up.ps1 for why
+# the difference matters. It matters more here: 5.1 aborts on the first native
+# command that writes to stderr, and gcloud and helm both do so routinely on
+# success. A teardown that dies partway through leaves the load balancer and
+# the cluster running and still billing, which is the exact outcome this
+# script exists to prevent.
+#Requires -Version 7.0
+
 <#
 .SYNOPSIS
   Destroys the ephemeral environment and verifies nothing billable is left.
