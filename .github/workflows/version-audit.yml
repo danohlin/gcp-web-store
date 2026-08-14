@@ -128,8 +128,31 @@ jobs:
           fi
 
           # Is the pinned major still offered by Cloud SQL?
-          if ! gcloud sql flags list --format='value(appliesTo)' 2>/dev/null | tr ',' '\n' | grep -q "POSTGRES_${TF_PG}"; then
-            note "Cloud SQL no longer lists POSTGRES_${TF_PG} as a supported version. A create would fail after the network and cluster have already been built."
+          #
+          # Not an unfiltered `gcloud sql flags list`: that returns MySQL flags
+          # and nothing else, so grepping its appliesTo column for POSTGRES_
+          # anything matched zero rows and the check reported the pin withdrawn
+          # on every single run. It fired against a project that had been
+          # running POSTGRES_17 two days earlier.
+          #
+          # Passing --database-version validates the value against the list of
+          # versions Cloud SQL accepts, and an unsupported one is rejected by
+          # name rather than by silence.
+          #
+          # The three outcomes are kept apart on purpose. Treating any non-zero
+          # exit as "withdrawn" would fold in network blips and missing
+          # permissions, which is the same false alarm wearing a new hat — and
+          # this check is only worth having if a finding from it is believable.
+          SQL_ERR=$(mktemp)
+          if gcloud sql flags list --database-version="POSTGRES_${TF_PG}" \
+               --format='value(name)' >/dev/null 2>"$SQL_ERR"; then
+            echo "cloud sql accepts POSTGRES_${TF_PG}"
+          elif grep -q 'Invalid choice' "$SQL_ERR"; then
+            note "Cloud SQL no longer accepts POSTGRES_${TF_PG}. A create would fail after the network and cluster have already been built."
+          else
+            # Surfaced, but not filed as a finding: this says the check could
+            # not run, which is not the same as the pin being stale.
+            echo "::warning::Could not verify POSTGRES_${TF_PG} against Cloud SQL: $(tr '\n' ' ' < "$SQL_ERR")"
           fi
 
           # ---------------------------------------------------------------
@@ -208,6 +231,22 @@ jobs:
           else
             gh issue create --title "$TITLE" --body "$BODY" --label dependencies 2>/dev/null \
               || gh issue create --title "$TITLE" --body "$BODY"
+          fi
+
+      # The issue body tells you to re-run the audit to close it out, so the
+      # re-run had better actually close it. Without this the issue outlives
+      # the finding, and an audit whose issues linger after the fix trains you
+      # to ignore them.
+      - name: Close the issue once everything is current
+        if: steps.audit.outputs.has_findings == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          EXISTING=$(gh issue list --state open --search "Pinned versions need attention in:title" \
+                       --json number --jq '.[0].number // empty')
+          if [ -n "$EXISTING" ]; then
+            gh issue close "$EXISTING" --comment "All pinned versions are current as of this run. Closed automatically by \`version-audit.yml\`."
           fi
 
       - name: Summary
