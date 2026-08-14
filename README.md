@@ -1,12 +1,12 @@
 # web-store
 
 A full-featured shopping cart and storefront, containerised and deployed to
-Amazon EKS. Payments are simulated — no real gateway, no real card is ever
+GKE Autopilot. Payments are simulated — no real gateway, no real card is ever
 charged.
 
-The AWS environment is **ephemeral by design**: brought up in the morning,
-destroyed at the end of the day, costing roughly **$1.50 for an eight-hour
-day** and **~$0.10/month** while torn down.
+The cloud environment is **ephemeral by design**: brought up in the morning,
+destroyed at the end of the day, costing roughly **$1.20 for an eight-hour day**
+and **~$0.10/month** while torn down.
 
 ---
 
@@ -16,13 +16,13 @@ day** and **~$0.10/month** while torn down.
 |---|---|
 | Backend | Node 24, Express 5, Prisma, TypeScript |
 | Frontend | React 19, Vite, TypeScript |
-| Database | PostgreSQL 17 (RDS in AWS) |
+| Database | PostgreSQL 17 (Cloud SQL when deployed) |
 | Payments | Mock gateway behind a `PaymentProvider` interface |
 | Containers | Docker, multi-stage, non-root, read-only root filesystem |
-| Orchestration | Amazon EKS, Helm |
+| Orchestration | GKE Autopilot, Helm |
 | Infrastructure | Terraform, split into persistent and ephemeral stacks |
-| Secrets | AWS Secrets Manager via the Secrets Store CSI driver |
-| CI/CD | GitHub Actions with OIDC — no long-lived AWS keys |
+| Secrets | Secret Manager via the GKE Secret Manager CSI component |
+| CI/CD | GitHub Actions with Workload Identity Federation — no service account keys |
 
 ## Features
 
@@ -38,17 +38,23 @@ order management · responsive, keyboard-navigable UI.
 ```
 backend/          Express API, Prisma schema and migrations, 83 integration tests
 frontend/         React SPA served by nginx in production
-helm/web-store/   Chart: deployments, services, ALB ingress, HPAs, migration hook
+helm/web-store/   Chart: deployments, services, ingress, HPAs, migration hook
 infra/
-  persistent/     State bucket, ECR, GitHub OIDC. Applied once, never destroyed.
-  ephemeral/      VPC, EKS, RDS, IRSA, Secrets Manager. Destroyed nightly.
+  persistent/     State bucket, Artifact Registry, Workload Identity Federation.
+                  Applied once, never destroyed.
+  ephemeral/      VPC, GKE, Cloud SQL, Secret Manager. Destroyed nightly.
 scripts/          up / down / orphan sweep / hook installer
-.github/workflows ci.yml (tests, no AWS) and deploy.yml (OIDC, build, deploy)
+.github/workflows ci.yml (tests, no cloud access) and deploy.yml (build, deploy)
 ```
 
 ---
 
 ## Local development
+
+Nothing here touches GCP. The application reads its configuration from files
+under `SECRETS_DIR` if present and falls back to environment variables, so
+compose supplies plain env vars and the deployed chart supplies mounted files —
+the same code path either way.
 
 ### Everything in containers
 
@@ -68,8 +74,10 @@ seed to completion, starts the API, then nginx. Local sign-ins:
 | Admin | `admin@web-store.local` | `ChangeMe-Admin-123` |
 | Customer | `customer@web-store.local` | `ChangeMe-Customer-123` |
 
-These defaults are local-only. In AWS the same accounts get generated passwords
-from Secrets Manager.
+These defaults are local-only, and the seed **refuses** to use them when
+`NODE_ENV=production` — a failed secret mount stops the migration rather than
+creating a real admin account with a password published in this file. Deployed
+environments get generated passwords from Secret Manager.
 
 Tear down with `docker compose down`, or `docker compose down -v` to discard the
 database volume too.
@@ -120,18 +128,32 @@ partial unique index on active carts — only exist in the database.
 
 ---
 
-## Deploying to AWS
+## Deploying to GCP
 
 ### Prerequisites
 
-- Terraform ≥ 1.10, AWS CLI v2, kubectl, Helm, Docker
-- An AWS profile with permission to create VPC, EKS, RDS, IAM and Secrets
-  Manager resources
+- Terraform ≥ 1.10, gcloud CLI, kubectl, Helm, Docker
+- A GCP project with billing linked, and permission to create VPC, GKE,
+  Cloud SQL, IAM and Secret Manager resources
 
 ```powershell
-$env:AWS_PROFILE = "terraform"
-aws sts get-caller-identity        # confirm before going further
+gcloud auth login
+gcloud auth application-default login
+gcloud config set project <PROJECT_ID>
+gcloud config get-value project        # confirm before going further
 ```
+
+Enable the three APIs Terraform needs before it can enable the rest:
+
+```powershell
+gcloud services enable cloudresourcemanager.googleapis.com iam.googleapis.com serviceusage.googleapis.com
+```
+
+> **The project id is never committed.** It has no default in either Terraform
+> root and is supplied through the gitignored `terraform.tfvars`, or by exporting
+> `TF_VAR_project_id`. The scripts read it from your gcloud config. The project
+> *number* is read from the `google_project` data source at plan time, so it
+> never appears either. This repository is public; keep it that way.
 
 ### One-time setup
 
@@ -150,56 +172,66 @@ cd infra/persistent
 terraform init -backend=false
 terraform apply
 terraform init -migrate-state `
-  -backend-config="bucket=web-store-tfstate-$(aws sts get-caller-identity --query Account --output text)" `
-  -backend-config="key=persistent/terraform.tfstate" `
-  -backend-config="region=us-east-1" `
-  -backend-config="encrypt=true" -backend-config="use_lockfile=true"
+  -backend-config="bucket=web-store-tfstate-$(gcloud config get-value project)" `
+  -backend-config="prefix=persistent"
 ```
 
-Then add the CI role ARN as a GitHub repository **variable** named
-`AWS_ROLE_ARN` (Settings → Secrets and variables → Actions → Variables):
+Then add two GitHub repository **variables** (Settings → Secrets and variables →
+Actions → Variables):
 
 ```powershell
-terraform -chdir=infra/persistent output -raw github_actions_role_arn
+terraform -chdir=infra/persistent output -raw workload_identity_provider
+terraform -chdir=infra/persistent output -raw github_actions_service_account
 ```
 
-A variable rather than a secret: the ARN grants nothing without a matching OIDC
-token from this repository's `main` branch, and keeping it visible makes CI
-failures far easier to debug.
+as `GCP_WORKLOAD_IDENTITY_PROVIDER` and `GCP_SERVICE_ACCOUNT`. Variables rather
+than secrets: neither grants anything without a matching OIDC token from this
+repository's `main` branch, and keeping them visible makes CI failures far
+easier to debug. They do embed the project number, which is why they live in
+repository settings rather than in a committed file.
 
 ### Daily cycle
 
 ```powershell
-.\scripts\up.ps1        # ~20 minutes; prints the store URL when ready
-.\scripts\down.ps1      # ~15 minutes; sweeps for anything still billable
+.\scripts\up.ps1        # ~15 minutes; prints the store URL when ready
+.\scripts\down.ps1      # ~10 minutes; sweeps for anything still billable
 ```
 
-`up.ps1` applies both stacks, installs the ALB controller and Secrets Store CSI
-driver, builds and pushes images, deploys the chart, and waits for the load
-balancer to answer. Useful flags: `-SkipInfra` to redeploy the app only,
-`-SkipBuild` to reuse images already in ECR.
+`up.ps1` applies both stacks, builds and pushes images, deploys the chart, and
+waits for the load balancer to answer. Useful flags: `-SkipInfra` to redeploy the
+app only, `-SkipBuild` to reuse images already in the registry.
 
-Sign-in passwords for a deployed environment come from Secrets Manager and are
+There is no add-on installation stage. The Ingress controller is part of the GKE
+control plane, and the Secret Manager CSI component is enabled by a field on the
+cluster resource — so unlike the AWS predecessor this replaced, no third-party
+Helm charts are installed into `kube-system` at all.
+
+Sign-in passwords for a deployed environment come from Secret Manager and are
 deliberately never printed:
 
 ```powershell
-aws secretsmanager get-secret-value --secret-id web-store/dev/app `
-  --query SecretString --output text
+gcloud secrets versions access latest --secret=web-store-dev-seed-admin-password
 ```
 
 ### Cost
 
 | State | Cost |
 |---|---|
-| Running | ~$0.19/hr — EKS control plane $0.10, two Spot nodes, RDS `t4g.micro`, ALB |
-| Destroyed | ~$0.10/month — S3 state and ECR images only |
+| Running | ~$0.15/hr — Autopilot cluster fee $0.10, pods on Spot, Cloud SQL `db-f1-micro`, external load balancer |
+| Destroyed | ~$0.10/month — GCS state and container images only |
 
-Deliberate savings: **no NAT gateway** (nodes sit in public subnets with no
-inbound rules; the database stays fully private), **Spot** nodes, **single-AZ**
-RDS, and **no KMS** customer-managed key.
+The cluster fee is often **$0** in practice: GKE gives each billing account
+$74.40/month of free cluster management, enough to cover one Autopilot cluster.
 
-Set `budget_notification_email` in `terraform.tfvars` to get alerted at 80%
-actual and 100% forecast spend.
+Deliberate savings: **no Cloud NAT** (Artifact Registry, Secret Manager and
+Cloud SQL are all reachable over Private Google Access), **Spot Pods**,
+**single-zone** Cloud SQL on the smallest shared-core tier, **no backups**, and
+workload logging trimmed to system components only.
+
+Set `budget_notification_email` and `billing_account_id` in `terraform.tfvars` to
+get alerted at 80% actual and 100% forecast spend. The budget needs
+`roles/billing.costsManager` on the *billing account*, not the project — a higher
+bar than everything else here, which is why it is opt-in.
 
 ---
 
@@ -208,31 +240,37 @@ actual and 100% forecast spend.
 Nothing sensitive is ever committed, printed, or placed in a manifest.
 
 1. Terraform **generates** the database password, JWT signing keys and seed
-   passwords, and writes them straight to Secrets Manager. They never pass
-   through your terminal.
-2. The **Secrets Store CSI driver** mounts each value as its own file on a
-   tmpfs volume inside the pod.
+   passwords, and writes them straight to Secret Manager — one secret per value.
+   They never pass through your terminal.
+2. The **GKE Secret Manager CSI component** mounts each value as its own file on
+   a tmpfs volume inside the pod.
 3. The app reads them **from disk** via `SECRETS_DIR`. They are never
    environment variables, so they cannot appear in `kubectl describe pod`, in a
    child process environment, or in etcd — nothing is synced to a Kubernetes
-   Secret.
-4. Pods reach AWS through **IRSA**; there are no static credentials in the
-   cluster. CI reaches AWS through **OIDC**; there are no static credentials in
+   Secret, and this provider has no option to.
+4. Pods authenticate through **Workload Identity Federation** as their own
+   Kubernetes service account; there are no static credentials in the cluster,
+   and no Google service account in the path. CI authenticates the same way and
+   impersonates a service account with three permissions; there are no keys in
    GitHub.
+
+Access is per-secret. The application service account can read all nine values;
+the migration Job can read the seven it needs and not the JWT signing keys.
 
 The database password is generated alphanumeric-only, because the migration Job
 assembles a `DATABASE_URL` with shell interpolation where punctuation would need
 percent-encoding.
 
 **Terraform state contains those generated values in plaintext** — unavoidable
-for any Terraform-managed secret. That is why state lives in S3 with encryption,
-versioning, enforced TLS and all public access blocked, and why no state file is
-kept on local disk.
+for any Terraform-managed secret. That is why state lives in a GCS bucket with
+versioning, uniform bucket-level access and public access prevention enforced,
+and why no state file is kept on local disk.
 
 A pre-commit hook blocks `.env` files, tfvars, tfstate, private keys,
-kubeconfigs, AWS access keys, and hardcoded account ids in ARNs or ECR URIs.
-CI runs **gitleaks** over the full history, because a local hook can be bypassed
-with `--no-verify` and is per-clone.
+kubeconfigs, service account key JSON, API keys, OAuth tokens, and hardcoded
+project ids, project numbers, registry URIs and billing account ids. CI runs
+**gitleaks** and **TruffleHog** over the full history, because a local hook can
+be bypassed with `--no-verify` and is per-clone.
 
 ---
 
@@ -241,15 +279,22 @@ with `--no-verify` and is per-clone.
 **`ci.yml`** — on every push and pull request. Lints, typechecks and tests both
 apps against a real Postgres, builds all three images without pushing, renders
 the chart and validates it with kubeconform, checks `terraform fmt` and
-`validate`, and scans history with gitleaks. It has **no AWS access at all**, so
-a pull request from a fork can never reach the cloud account.
+`validate`, and scans history with gitleaks. It has **no cloud access at all**,
+so a pull request from a fork can never reach the project.
 
-**`deploy.yml`** — on push to `main`, or manually. Assumes the CI role via OIDC,
-pushes images tagged with the commit SHA, then deploys. If no cluster is running
-— the normal state overnight — it pushes the images and skips the deploy rather
-than failing.
+**`deploy.yml`** — on push to `main`, or manually. Authenticates via Workload
+Identity Federation, pushes images tagged with the commit SHA, then deploys. If
+no cluster is running — the normal state overnight — it pushes the images and
+skips the deploy rather than failing.
 
-CI derives every name it needs (cluster, namespace, secret names, IRSA role ARN)
+**`version-audit.yml`** — weekly. Checks that the pins in this repository still
+match reality: the Kubernetes version CI validates against versus what the
+release channel serves, the Postgres major across Cloud SQL, CI and compose, the
+Terraform provider and core versions, kubeconform, and the nginx base image. It
+fails loudly if any of its extraction patterns stop matching, because an audit
+that silently checks nothing is worse than no audit.
+
+CI derives every name it needs (cluster, namespace, secret prefix, registry)
 from the naming convention rather than reading Terraform state, so it never
 needs access to a file holding the database password.
 
@@ -257,55 +302,55 @@ needs access to a file holding the database password.
 
 ## Troubleshooting
 
-**`Not authorized to perform sts:AssumeRoleWithWebIdentity`**
+**Workflow fails at the authentication step**
 
-GitHub sends an **immutable** subject claim containing numeric ids:
+Check the two repository variables exist and are spelled exactly
+`GCP_WORKLOAD_IDENTITY_PROVIDER` and `GCP_SERVICE_ACCOUNT`. The provider value
+is the full resource name, not the short id:
 
 ```
-repo:owner@8661324/web-store@1317833055:ref:refs/heads/main
+projects/<number>/locations/global/workloadIdentityPools/github/providers/github
 ```
 
-not the name-only `repo:owner/repo:ref:...` that most documentation shows. A
-`repo:owner/repo:*` wildcard does *not* fix it, because the `@id` segments sit
-inside the parts being matched — which makes this look like anything but a
-subject problem.
+If they are right and it still fails, the `attribute_condition` on the provider
+is the next place to look — it pins the repository owner, the repository, and
+the ref, so a run from any branch other than `main` is refused by design.
 
-The workflow error carries no detail. **CloudTrail does**:
+**Pods stuck in `ContainerCreating` with a CSI error**
+
+The driver name is `secrets-store-gke.csi.k8s.io`, not the upstream
+`secrets-store.csi.k8s.io`. The upstream Secrets Store CSI driver cannot run on
+Autopilot at all — its DaemonSet needs privileged write-mode hostPath mounts,
+which Autopilot forbids. If the driver name is right, check that the pod's
+service account matches the namespace and name in the `principal://` binding in
+`infra/ephemeral/secrets.tf`; a mismatch surfaces as `PermissionDenied` rather
+than as a naming error.
+
+**`terraform destroy` fails at the very end**
+
+Almost always deletion protection. There are *two* separate flags on the
+database — the provider-level `deletion_protection` and the API-level
+`settings.deletion_protection_enabled` — plus one on the cluster, and the
+provider-level ones default to **true**. All three are set false here; if you
+have edited them, that is the first thing to check.
+
+**Something is still costing money after teardown**
 
 ```powershell
-aws cloudtrail lookup-events --region us-east-1 `
-  --lookup-attributes AttributeKey=EventName,AttributeValue=AssumeRoleWithWebIdentity `
-  --max-results 5
+.\scripts\check-orphans.ps1
 ```
 
-The `userIdentity.userName` field shows the exact subject presented. Go here
-first; it turns an hour of guessing into one command.
+Read-only. The load balancer is created by the Ingress controller, not by
+Terraform, so `terraform destroy` does not remove it — and an orphaned global
+forwarding rule keeps billing at roughly $0.025/hr with nothing pointing at it.
+`down.ps1` avoids this by uninstalling the release and polling until the load
+balancer is really gone before destroying anything; note that the Ingress object
+can disappear while the controller is still deleting it.
 
-**`terraform destroy` hangs, then fails on subnets**
-
-The ALB and its security groups are created by the load balancer controller,
-not by Terraform, so Terraform does not know they exist. Destroying the VPC
-while they are still there strands network interfaces that block subnet
-deletion. `down.ps1` handles this by uninstalling the release and polling AWS
-until the ALB is really gone — note that the Ingress object can disappear while
-the controller is still deleting the load balancer.
-
-To recover manually:
-
-```powershell
-aws elbv2 describe-load-balancers --query "LoadBalancers[?contains(LoadBalancerName,'k8s-')]"
-aws ec2 describe-network-interfaces --filters Name=vpc-id,Values=<vpc-id> Name=status,Values=available
-```
-
-**`A secret with this name is scheduled for deletion`**
-
-A deleted secret keeps its name reserved for 7–30 days by default, which breaks
-a daily rebuild. Both secrets set `recovery_window_in_days = 0`. If you hit this
-on a secret created another way:
-
-```powershell
-aws secretsmanager delete-secret --secret-id <name> --force-delete-without-recovery
-```
+The sweep reports forwarding rules, proxies, URL maps, backend services, health
+checks, NEGs, GKE firewall rules, unattached addresses in both scopes, clusters,
+Cloud SQL instances and backups, unattached disks, Cloud NAT, networks and
+leftover secrets.
 
 **Deploy failed and the pods never rolled**
 
@@ -316,15 +361,9 @@ workflow prints its logs on failure; locally:
 kubectl logs -n web-store -l app.kubernetes.io/component=migrate --tail=100
 ```
 
-**Something is still costing money after teardown**
-
-```powershell
-.\scripts\check-orphans.ps1 -Region us-east-1
-```
-
-Read-only. Reports load balancers, orphaned ENIs and security groups, unattached
-EBS volumes and EIPs, surviving log groups, RDS snapshots, and secrets pending
-deletion.
+If it timed out rather than errored, note that `activeDeadlineSeconds` counts
+from Job creation and Autopilot has to provision capacity for the hook Job
+first — one to three minutes on a cold cluster.
 
 ---
 
@@ -332,11 +371,15 @@ deletion.
 
 - **Email is not wired up.** Password reset works, but the token is surfaced in
   the API response outside production instead of being emailed. Real delivery
-  needs SES with a verified domain.
-- **No HTTPS.** Without a domain the ALB serves plain HTTP on its
-  `*.elb.amazonaws.com` hostname, so `app.cookieSecure` stays `false`. Setting
-  `ingress.certificateArn` and a domain enables TLS — and only then should
-  `cookieSecure` be turned on, or browsers will silently drop the refresh cookie.
+  needs an email provider with a verified sender domain.
+- **No HTTPS.** Without a domain the load balancer serves plain HTTP on its raw
+  IP, so `app.cookieSecure` stays `false`. Setting `ingress.managedCertificateName`
+  and a domain enables TLS — and only then should `cookieSecure` be turned on, or
+  browsers will silently drop the refresh cookie.
+- **Ingress, not Gateway API.** Google now leads with Gateway API for new work.
+  Ingress was the smaller, lower-risk port and every Gateway advantage —
+  multiple certificates, traffic splitting, header matching — needs a domain
+  first. Worth revisiting at the same time as TLS.
 - **No stock reservation during checkout.** Overselling is prevented by a
   conditional decrement at order time, but items are not held while a customer
   fills in the form.
