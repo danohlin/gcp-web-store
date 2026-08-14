@@ -1,7 +1,8 @@
 name: Deploy
 
-# Only from main, matching the OIDC trust policy. A run from any other ref
-# cannot assume the role, so this would fail at the credentials step.
+# Only from main, matching the Workload Identity provider's attribute_condition.
+# A run from any other ref cannot impersonate the service account, so this would
+# fail at the auth step.
 on:
   push:
     branches: [main]
@@ -13,8 +14,8 @@ on:
         default: dev
 
 permissions:
-  # Required for GitHub to mint the OIDC token. Without it the credentials
-  # step fails with "Could not load OIDC token".
+  # Required for GitHub to mint the OIDC token. Without it the auth step fails
+  # with "GitHub Actions did not inject the token".
   id-token: write
   contents: read
 
@@ -25,7 +26,10 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  AWS_REGION: us-east-1
+  # No project id here on purpose: it is an account identifier and this
+  # repository is public. It comes from the auth step's output at runtime, the
+  # same way the AWS account id used to come from sts get-caller-identity.
+  REGION: us-central1
   PROJECT: web-store
   ENVIRONMENT: ${{ inputs.environment || 'dev' }}
 
@@ -37,36 +41,52 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # No access keys anywhere. GitHub mints a short-lived token, AWS trades it
-      # for temporary credentials, and they expire when the job ends.
-      - name: Assume the deploy role
-        uses: aws-actions/configure-aws-credentials@v4
+      # No service account keys anywhere. GitHub mints a short-lived token, GCP
+      # trades it for an impersonated access token, and it expires when the job
+      # ends.
+      #
+      # Impersonation rather than direct federation: federated principalSet
+      # tokens are capped at ten minutes and are not accepted by every GCP API.
+      - name: Authenticate to Google Cloud
+        id: auth
+        uses: google-github-actions/auth@v3
         with:
-          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
-          aws-region: ${{ env.AWS_REGION }}
-          role-session-name: gha-${{ github.run_id }}
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_SERVICE_ACCOUNT }}
+
+      - uses: google-github-actions/setup-gcloud@v3.0.1
 
       - name: Resolve names
         id: names
         run: |
           set -euo pipefail
-          ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
-          REGISTRY="${ACCOUNT}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+          # Extracted by the auth step from the service account email. If that
+          # ever fails it comes back empty, and every image tag below would
+          # silently become <region>-docker.pkg.dev//web-store/... — a push to a
+          # malformed path, failing somewhere far less obvious than here.
+          PROJECT_ID='${{ steps.auth.outputs.project_id }}'
+          if [ -z "$PROJECT_ID" ]; then
+            echo "::error::The auth step returned no project_id. Set project_id explicitly on google-github-actions/auth."
+            exit 1
+          fi
+          REGISTRY="${REGION}-docker.pkg.dev/${PROJECT_ID}/${PROJECT}"
           # Every name is derived from the naming convention rather than read
           # from Terraform state. CI therefore needs no access to that state,
           # which holds the database password in plaintext.
           {
+            echo "project_id=${PROJECT_ID}"
             echo "registry=${REGISTRY}"
             echo "cluster=${PROJECT}-${ENVIRONMENT}"
             echo "namespace=${PROJECT}"
-            echo "db_secret=${PROJECT}/${ENVIRONMENT}/db"
-            echo "app_secret=${PROJECT}/${ENVIRONMENT}/app"
-            echo "app_role=arn:aws:iam::${ACCOUNT}:role/${PROJECT}-${ENVIRONMENT}-app"
+            echo "secret_prefix=${PROJECT}-${ENVIRONMENT}"
             echo "tag=${GITHUB_SHA::7}"
           } >> "$GITHUB_OUTPUT"
 
-      - name: Log in to ECR
-        uses: aws-actions/amazon-ecr-login@v2
+      # Installs a docker credential helper, so the subsequent pushes
+      # authenticate transparently. No token piping, and no password on a
+      # command line.
+      - name: Log in to Artifact Registry
+        run: gcloud auth configure-docker "${REGION}-docker.pkg.dev" --quiet
 
       - uses: docker/setup-buildx-action@v3
 
@@ -78,7 +98,7 @@ jobs:
           push: true
           # See scripts/up.ps1 for why attestations are off.
           provenance: false
-          tags: ${{ steps.names.outputs.registry }}/${{ env.PROJECT }}/backend:${{ steps.names.outputs.tag }}
+          tags: ${{ steps.names.outputs.registry }}/backend:${{ steps.names.outputs.tag }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
@@ -90,7 +110,7 @@ jobs:
           push: true
           # See scripts/up.ps1 for why attestations are off.
           provenance: false
-          tags: ${{ steps.names.outputs.registry }}/${{ env.PROJECT }}/migrator:${{ steps.names.outputs.tag }}
+          tags: ${{ steps.names.outputs.registry }}/migrator:${{ steps.names.outputs.tag }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
@@ -101,7 +121,7 @@ jobs:
           push: true
           # See scripts/up.ps1 for why attestations are off.
           provenance: false
-          tags: ${{ steps.names.outputs.registry }}/${{ env.PROJECT }}/frontend:${{ steps.names.outputs.tag }}
+          tags: ${{ steps.names.outputs.registry }}/frontend:${{ steps.names.outputs.tag }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
@@ -111,8 +131,8 @@ jobs:
       - name: Is the cluster up?
         id: cluster
         run: |
-          if aws eks describe-cluster --name "${{ steps.names.outputs.cluster }}" \
-               --region "$AWS_REGION" >/dev/null 2>&1; then
+          if gcloud container clusters describe "${{ steps.names.outputs.cluster }}" \
+               --region "$REGION" >/dev/null 2>&1; then
             echo "exists=true" >> "$GITHUB_OUTPUT"
           else
             echo "exists=false" >> "$GITHUB_OUTPUT"
@@ -124,10 +144,10 @@ jobs:
 
       - name: Configure kubectl
         if: steps.cluster.outputs.exists == 'true'
-        run: |
-          aws eks update-kubeconfig \
-            --name "${{ steps.names.outputs.cluster }}" \
-            --region "$AWS_REGION"
+        uses: google-github-actions/get-gke-credentials@v3.0.0
+        with:
+          cluster_name: ${{ steps.names.outputs.cluster }}
+          location: ${{ env.REGION }}
 
       - name: Deploy
         if: steps.cluster.outputs.exists == 'true'
@@ -137,17 +157,15 @@ jobs:
             --namespace "${{ steps.names.outputs.namespace }}" \
             --create-namespace \
             -f ./helm/web-store/values-dev.yaml \
-            --set "backend.image.repository=${{ steps.names.outputs.registry }}/${PROJECT}/backend" \
+            --set "backend.image.repository=${{ steps.names.outputs.registry }}/backend" \
             --set backend.image.tag=${{ steps.names.outputs.tag }} \
-            --set "frontend.image.repository=${{ steps.names.outputs.registry }}/${PROJECT}/frontend" \
+            --set "frontend.image.repository=${{ steps.names.outputs.registry }}/frontend" \
             --set frontend.image.tag=${{ steps.names.outputs.tag }} \
-            --set "migration.image.repository=${{ steps.names.outputs.registry }}/${PROJECT}/migrator" \
+            --set "migration.image.repository=${{ steps.names.outputs.registry }}/migrator" \
             --set migration.image.tag=${{ steps.names.outputs.tag }} \
-            --set secrets.region="$AWS_REGION" \
-            --set secrets.databaseSecretName=${{ steps.names.outputs.db_secret }} \
-            --set secrets.appSecretName=${{ steps.names.outputs.app_secret }} \
-            --set serviceAccount.roleArn=${{ steps.names.outputs.app_role }} \
-            --wait --timeout 10m
+            --set secrets.projectId=${{ steps.names.outputs.project_id }} \
+            --set secrets.prefix=${{ steps.names.outputs.secret_prefix }} \
+            --wait --timeout 15m
 
       # The migration hook runs before the pods roll, so when a deploy fails it
       # is usually the Job that explains why. Surface it rather than making
@@ -170,11 +188,12 @@ jobs:
             echo "| Tag | \`${{ steps.names.outputs.tag }}\` |"
             echo "| Cluster | \`${{ steps.names.outputs.cluster }}\` |"
             if [ "${{ steps.cluster.outputs.exists }}" = "true" ]; then
+              # .ip, not .hostname. A Google Cloud load balancer publishes an
+              # address; only an ALB populates hostname.
               ADDR=$(kubectl get ingress "$PROJECT" -n "${{ steps.names.outputs.namespace }}" \
-                     -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || echo "pending")
-              echo "| URL | http://${ADDR} |"
+                     -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || echo "pending")
+              echo "| URL | http://${ADDR:-pending} |"
             else
               echo "| Status | Cluster down - images pushed, deploy skipped |"
             fi
           } >> "$GITHUB_STEP_SUMMARY"
-

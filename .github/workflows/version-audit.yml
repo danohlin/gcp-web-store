@@ -1,11 +1,15 @@
 name: Version audit
 
 # Every pinned external version in this repository is a hardcoded literal with
-# no mechanism to notice when it goes stale. That gap has bitten twice already:
-# EKS was pinned to a version four months past end of standard support, which
-# silently quadruples the bill, and the vendored ALB controller IAM policy
-# drifted two majors behind its own chart, withholding a permission the Ingress
-# depends on.
+# no mechanism to notice when it goes stale. That gap has bitten before: on AWS
+# the cluster sat four months past end of standard support, silently
+# quadrupling the bill, and a vendored IAM policy drifted two majors behind its
+# own chart, withholding a permission the Ingress depended on.
+#
+# Both of those specific traps are gone with the move to GKE — release channels
+# auto-upgrade and there is no vendored policy — but the general problem is not,
+# and two pins that previously had no watcher at all now do: the Postgres major,
+# which is asserted to agree across three files, and Terraform core.
 #
 # This checks the pins against reality once a week and opens an issue when
 # something needs attention. It is read-only and changes nothing.
@@ -22,7 +26,7 @@ permissions:
   id-token: write
 
 env:
-  AWS_REGION: us-east-1
+  REGION: us-central1
 
 jobs:
   audit:
@@ -32,24 +36,20 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # Read-only AWS access, needed for the EKS support dates. Uses the same
-      # OIDC role as deploys; it can describe but not create.
-      - name: Assume the deploy role
-        uses: aws-actions/configure-aws-credentials@v4
+      # Read-only GCP access, needed for the GKE channel and Cloud SQL version
+      # lookups. Uses the same service account as deploys; it can describe but
+      # not create.
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v3
         with:
-          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
-          aws-region: ${{ env.AWS_REGION }}
-          role-session-name: gha-audit-${{ github.run_id }}
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_SERVICE_ACCOUNT }}
 
-      - uses: azure/setup-helm@v4
+      - uses: google-github-actions/setup-gcloud@v3.0.1
 
       - name: Audit
         id: audit
         run: |
-          # shellcheck disable=SC2016
-          # This script is largely regex over config files. Single quotes are
-          # correct throughout: every $ here is an end-of-line anchor or a
-          # literal PowerShell sigil being matched, never a variable to expand.
           set -uo pipefail
           FINDINGS=""
           note() { FINDINGS="${FINDINGS}- $1"$'\n'; echo "::warning::$1"; }
@@ -67,90 +67,99 @@ jobs:
           }
 
           # ---------------------------------------------------------------
-          # EKS: is the pinned version still in standard support?
+          # Does the Kubernetes version CI validates against still match what
+          # the cluster's release channel actually serves?
           #
-          # A cluster past that date keeps working and moves to extended
-          # support at $0.60/hr instead of $0.10 — nothing fails, the bill
-          # just grows. This is the check that matters most.
+          # The EKS check this replaces was about cost: a version past end of
+          # standard support quadrupled the control plane bill. GKE channels
+          # auto-upgrade, so that cannot happen. What can happen is quieter —
+          # kubeconform keeps validating against an API version the cluster no
+          # longer runs, so a manifest passes CI and fails on apply.
           # ---------------------------------------------------------------
-          # awk over the whole variable block rather than a fixed -A window:
-          # the description is a long heredoc and grep -A20 stopped short of
-          # the default, silently yielding an empty version.
-          PINNED_EKS=$(awk '/variable "kubernetes_version"/,/^}/' infra/ephemeral/variables.tf \
-                       | grep -m1 'default' | sed -E 's/.*"([0-9.]+)".*/\1/')
-          require 'the pinned EKS version' "$PINNED_EKS"
-          EOL=$(aws eks describe-cluster-versions --region "$AWS_REGION" \
-                --query "clusterVersions[?clusterVersion=='${PINNED_EKS}'].endOfStandardSupportDate" \
-                --output text 2>/dev/null | cut -d'T' -f1)
-          NEWEST=$(aws eks describe-cluster-versions --region "$AWS_REGION" \
-                   --query 'clusterVersions[].clusterVersion' --output text 2>/dev/null | tr '\t' '\n' | sort -V | tail -1)
+          CI_K8S=$(grep -m1 -oE '\-kubernetes-version [0-9]+\.[0-9]+\.[0-9]+' .github/workflows/ci.yml \
+                   | sed -E 's/.* //')
+          require 'the kubeconform Kubernetes version' "$CI_K8S"
 
-          echo "EKS pinned=$PINNED_EKS end-of-standard-support=$EOL newest=$NEWEST"
-          if [ -n "$EOL" ]; then
-            if [ "$(date -u +%Y-%m-%d)" \> "$EOL" ]; then
-              note "**EKS ${PINNED_EKS} is past end of standard support** (ended ${EOL}). The control plane now bills at \$0.60/hr instead of \$0.10. Newest available: ${NEWEST}. Fix: \`kubernetes_version\` in \`infra/ephemeral/variables.tf\`."
-            elif [ "$(date -u -d '+90 days' +%Y-%m-%d)" \> "$EOL" ]; then
-              note "EKS ${PINNED_EKS} leaves standard support on ${EOL}, within 90 days. Newest available: ${NEWEST}."
+          # Anchored to the assignment. An unanchored grep for 'default' matches
+          # the description heredoc above it, which uses the word in prose —
+          # it yielded a whole sentence rather than REGULAR.
+          CHANNEL=$(awk '/variable "release_channel"/,/^}/' infra/ephemeral/variables.tf \
+                    | grep -m1 -E '^\s*default\s*=' | sed -E 's/.*"([A-Z]+)".*/\1/')
+          if [ -z "$CHANNEL" ]; then
+            echo "::error::Could not extract the release channel from infra/ephemeral/variables.tf."
+            exit 1
+          fi
+
+          SERVER_DEFAULT=$(gcloud container get-server-config --region "$REGION" --format=json 2>/dev/null \
+                           | jq -r --arg ch "$CHANNEL" '.channels[] | select(.channel == $ch) | .defaultVersion' \
+                           | sed -E 's/-gke.*//')
+          echo "kubeconform=$CI_K8S channel=$CHANNEL server default=$SERVER_DEFAULT"
+          if [ -n "$SERVER_DEFAULT" ]; then
+            # Compare major.minor only; the patch moves constantly and is not
+            # worth an issue every week.
+            if [ "${CI_K8S%.*}" != "${SERVER_DEFAULT%.*}" ]; then
+              note "CI validates manifests against Kubernetes ${CI_K8S}, but the ${CHANNEL} channel now serves ${SERVER_DEFAULT}. Fix: \`-kubernetes-version\` in \`.github/workflows/ci.yml\`."
             fi
           fi
 
           # ---------------------------------------------------------------
-          # ALB controller: chart pin vs the vendored IAM policy
+          # Postgres major: three files must agree.
           #
-          # These are a matched pair. Letting them drift withheld
-          # elasticloadbalancing:SetRulePriorities, which is how the ALB
-          # orders routing rules — so /api stops taking precedence over the
-          # catch-all, on an arbitrary day, with nothing changed locally.
+          # This drifted unnoticed on AWS — RDS ran 16 while CI tested against
+          # 17 — because nothing compared them. Tests passing against a
+          # different major than production runs is exactly the sort of thing
+          # that surfaces as an inexplicable production-only bug.
           # ---------------------------------------------------------------
-          # Anchored to the assignment. An unanchored grep matched the doc
-          # comment above it, which mentions the variable by name. The leading
-          # '.' matches PowerShell's $ sigil without embedding a literal $.
-          CHART_PIN=$(grep -m1 '^.ALB_CHART_VERSION' scripts/up.ps1 | sed -E "s/.*'([0-9.]+)'.*/\1/")
-          POLICY_VER=$(grep -m1 'upstream policy v' infra/ephemeral/iam-irsa.tf | sed -E 's/.*v([0-9.]+).*/\1/')
-          require 'the ALB chart pin' "$CHART_PIN"
-          require 'the vendored ALB policy version' "$POLICY_VER"
-          echo "ALB chart pin=$CHART_PIN vendored policy=$POLICY_VER"
-          if [ "$CHART_PIN" != "$POLICY_VER" ]; then
-            note "**ALB controller chart (${CHART_PIN}) and its vendored IAM policy (${POLICY_VER}) disagree.** Re-vendor from \`https://raw.githubusercontent.com/kubernetes-sigs/aws-load-balancer-controller/v${CHART_PIN}/docs/install/iam_policy.json\`."
-          fi
+          TF_PG=$(awk '/variable "db_database_version"/,/^}/' infra/ephemeral/variables.tf \
+                  | grep -m1 -E '^\s*default\s*=' | sed -E 's/.*POSTGRES_([0-9]+).*/\1/')
+          CI_PG=$(grep -m1 -oE 'image: postgres:[0-9]+' .github/workflows/ci.yml | sed -E 's/.*://')
+          COMPOSE_PG=$(grep -m1 -oE 'image: postgres:[0-9]+' docker-compose.yml | sed -E 's/.*://')
 
-          # Does upstream still publish the policy we vendored?
-          if ! curl -sfI "https://raw.githubusercontent.com/kubernetes-sigs/aws-load-balancer-controller/v${POLICY_VER}/docs/install/iam_policy.json" >/dev/null; then
-            note "The vendored ALB IAM policy claims v${POLICY_VER}, but upstream has no such tag. The version comment is wrong."
-          fi
-
-          # ---------------------------------------------------------------
-          # Helm charts: newer major available?
-          # ---------------------------------------------------------------
-          helm repo add eks https://aws.github.io/eks-charts >/dev/null 2>&1
-          helm repo add secrets-store-csi-driver https://kubernetes-sigs.github.io/secrets-store-csi-driver/charts >/dev/null 2>&1
-          helm repo add aws-secrets-manager https://aws.github.io/secrets-store-csi-driver-provider-aws >/dev/null 2>&1
-          helm repo update >/dev/null 2>&1
-
-          check_chart() {
-            local repo="$1" var="$2" label="$3"
-            local pin latest
-            pin=$(grep -m1 "^.${var}" scripts/up.ps1 | sed -E "s/.*'([0-9.]+)'.*/\1/")
-            require "the ${label} pin" "$pin"
-            latest=$(helm search repo "$repo" --output json 2>/dev/null | jq -r '.[0].version // empty')
-            echo "$label pin=$pin latest=$latest"
-            if [ -n "$latest" ] && [ "${pin%%.*}" != "${latest%%.*}" ]; then
-              note "${label} is pinned at ${pin}; ${latest} is a newer major. Review before bumping — for the ALB controller the IAM policy must move with it."
+          for pair in "Cloud SQL:$TF_PG" "ci.yml:$CI_PG" "docker-compose.yml:$COMPOSE_PG"; do
+            if ! printf '%s' "${pair#*:}" | grep -qE '^[0-9]+$'; then
+              echo "::error::Could not extract the Postgres major from ${pair%%:*}. A pattern in this workflow no longer matches."
+              exit 1
             fi
-          }
-          check_chart eks/aws-load-balancer-controller ALB_CHART_VERSION 'ALB controller chart'
-          check_chart secrets-store-csi-driver/secrets-store-csi-driver CSI_DRIVER_CHART_VERSION 'Secrets Store CSI driver chart'
-          check_chart aws-secrets-manager/secrets-store-csi-driver-provider-aws CSI_AWS_CHART_VERSION 'CSI AWS provider chart'
+          done
+
+          echo "postgres cloudsql=$TF_PG ci=$CI_PG compose=$COMPOSE_PG"
+          if [ "$TF_PG" != "$CI_PG" ] || [ "$TF_PG" != "$COMPOSE_PG" ]; then
+            note "**Postgres majors disagree**: Cloud SQL ${TF_PG}, ci.yml ${CI_PG}, docker-compose.yml ${COMPOSE_PG}. Tests are not running against the engine production uses."
+          fi
+
+          # Is the pinned major still offered by Cloud SQL?
+          if ! gcloud sql flags list --format='value(appliesTo)' 2>/dev/null | tr ',' '\n' | grep -q "POSTGRES_${TF_PG}"; then
+            note "Cloud SQL no longer lists POSTGRES_${TF_PG} as a supported version. A create would fail after the network and cluster have already been built."
+          fi
 
           # ---------------------------------------------------------------
-          # Terraform AWS provider
+          # Terraform: provider major, and the core version CI installs
           # ---------------------------------------------------------------
-          PROV_PIN=$(grep -m1 -A1 'hashicorp/aws' infra/ephemeral/versions.tf | grep version | sed -E 's/.*~> ([0-9.]+).*/\1/')
-          require 'the AWS provider constraint' "$PROV_PIN"
-          PROV_LATEST=$(curl -s https://api.github.com/repos/hashicorp/terraform-provider-aws/releases/latest | jq -r '.tag_name' | tr -d 'v')
-          echo "AWS provider pin=$PROV_PIN latest=$PROV_LATEST"
-          if [ "${PROV_PIN%%.*}" != "${PROV_LATEST%%.*}" ]; then
-            note "Terraform AWS provider is constrained to ~> ${PROV_PIN}; ${PROV_LATEST} is a newer major. HashiCorp concentrates fixes on the current major."
+          PROV_PIN=$(grep -m1 -A1 'hashicorp/google' infra/ephemeral/versions.tf | grep version | sed -E 's/.*~> ([0-9.]+).*/\1/')
+          require 'the Google provider constraint' "$PROV_PIN"
+          PROV_LATEST=$(curl -s https://registry.terraform.io/v1/providers/hashicorp/google | jq -r '.version // empty')
+          echo "google provider pin=$PROV_PIN latest=$PROV_LATEST"
+          if [ -n "$PROV_LATEST" ] && [ "${PROV_PIN%%.*}" != "${PROV_LATEST%%.*}" ]; then
+            note "Terraform Google provider is constrained to ~> ${PROV_PIN}; ${PROV_LATEST} is a newer major. HashiCorp concentrates fixes on the current major."
+          fi
+
+          TF_CI=$(grep -m1 -oE 'terraform_version: [0-9]+\.[0-9]+\.[0-9]+' .github/workflows/ci.yml | sed -E 's/.* //')
+          require 'the Terraform version CI installs' "$TF_CI"
+          TF_LATEST=$(curl -s https://api.github.com/repos/hashicorp/terraform/releases/latest | jq -r '.tag_name' | tr -d 'v')
+          echo "terraform ci=$TF_CI latest=$TF_LATEST"
+          if [ -n "$TF_LATEST" ] && [ "${TF_CI%.*}" != "${TF_LATEST%.*}" ]; then
+            note "CI installs Terraform ${TF_CI}; ${TF_LATEST} is current. \`terraform validate\` is only as good as the version running it."
+          fi
+
+          # ---------------------------------------------------------------
+          # kubeconform, which validates every manifest in this repository
+          # ---------------------------------------------------------------
+          KC_PIN=$(grep -m1 -oE 'kubeconform/releases/download/v[0-9.]+' .github/workflows/ci.yml | sed -E 's/.*v//')
+          require 'the kubeconform pin' "$KC_PIN"
+          KC_LATEST=$(curl -s https://api.github.com/repos/yannh/kubeconform/releases/latest | jq -r '.tag_name' | tr -d 'v')
+          echo "kubeconform pin=$KC_PIN latest=$KC_LATEST"
+          if [ -n "$KC_LATEST" ] && [ "$KC_PIN" != "$KC_LATEST" ]; then
+            note "kubeconform is pinned at ${KC_PIN}; ${KC_LATEST} is available. Newer releases carry newer Kubernetes schemas."
           fi
 
           # ---------------------------------------------------------------
