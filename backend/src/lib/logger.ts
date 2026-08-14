@@ -3,7 +3,7 @@ import { config } from '../config/index.js';
 
 export const logger = pino({
   level: config.logLevel,
-  // Structured JSON in production so CloudWatch/Loki can parse it; pretty
+  // Structured JSON in production so Cloud Logging can parse it; pretty
   // output locally is left to `pino-pretty` piped in the dev script if wanted.
   base: { service: 'web-store-backend' },
   redact: {

@@ -183,7 +183,7 @@ export async function forgotPassword(email: string): Promise<ForgotPasswordResul
     },
   });
 
-  // TODO(email): send via SES once a verified sender domain exists.
+  // TODO(email): send via an email provider once a verified sender domain exists.
   logger.info({ userId: user.id }, 'password reset token issued (delivery not yet wired)');
 
   return config.nodeEnv === 'production' ? {} : { devToken: token };

@@ -112,6 +112,10 @@ metadata:
   labels:
     {{- include "web-store.labels" . | nindent 4 }}
     app.kubernetes.io/component: frontend
+  {{- if .Values.ingress.enabled }}
+  annotations:
+    cloud.google.com/backend-config: '{"default":"{{ include "web-store.fullname" . }}-frontend"}'
+  {{- end }}
 spec:
   type: ClusterIP
   ports:

@@ -1,6 +1,6 @@
 apiVersion: v2
 name: web-store
-description: Storefront API and SPA for Amazon EKS, fronted by an ALB.
+description: Storefront API and SPA for GKE Autopilot, fronted by a Cloud Load Balancer.
 type: application
 
 # Chart version is bumped by hand; appVersion tracks the container image tag and

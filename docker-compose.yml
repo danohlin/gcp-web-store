@@ -4,8 +4,9 @@ name: web-store
 # the nginx-served frontend. `docker compose up --build` gives a working store
 # on http://localhost:8080 with no host toolchain beyond Docker.
 #
-# The credentials below are local-only. Nothing here is used in AWS, where
-# Terraform generates the secrets and the Secrets Store CSI driver mounts them.
+# The credentials below are local-only. Nothing here is used in a deployed
+# environment, where Terraform generates the secrets and the Secret Manager CSI
+# driver mounts them as files.
 
 services:
   postgres:
@@ -29,7 +30,7 @@ services:
 
   # Runs to completion before the API starts. Uses the same image as the API,
   # so the migrations always match the code being deployed — the same guarantee
-  # the Helm pre-upgrade hook provides in EKS.
+  # the Helm pre-upgrade hook provides in the cluster.
   migrate:
     build:
       context: ./backend
@@ -62,8 +63,8 @@ services:
       PORT: '4000'
       LOG_LEVEL: info
       DATABASE_URL: postgresql://webstore:webstore@postgres:5432/webstore?schema=public
-      JWT_ACCESS_SECRET: local-compose-access-secret-not-for-aws
-      JWT_REFRESH_SECRET: local-compose-refresh-secret-not-for-aws
+      JWT_ACCESS_SECRET: local-compose-access-secret-not-for-deployment
+      JWT_REFRESH_SECRET: local-compose-refresh-secret-not-for-deployment
       # Same-origin through nginx, so no cross-origin allowance is needed.
       CORS_ORIGINS: ''
       COOKIE_SECURE: 'false'

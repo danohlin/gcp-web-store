@@ -5,8 +5,8 @@ on:
   push:
     branches: [main]
 
-# No AWS access anywhere in this workflow. It builds and tests only, so a pull
-# request from a fork can never reach the cloud account.
+# No cloud access anywhere in this workflow. It builds and tests only, so a pull
+# request from a fork can never reach the GCP project.
 permissions:
   contents: read
 
@@ -147,7 +147,7 @@ jobs:
       - uses: azure/setup-helm@v4
       - uses: hashicorp/setup-terraform@v3
         with:
-          terraform_version: 1.10.5
+          terraform_version: 1.15.8
 
       - name: helm lint
         run: |
@@ -155,7 +155,7 @@ jobs:
             --set backend.image.repository=example --set backend.image.tag=ci \
             --set frontend.image.repository=example --set frontend.image.tag=ci \
             --set migration.image.repository=example --set migration.image.tag=ci \
-            --set secrets.databaseSecretName=db --set secrets.appSecretName=app
+            --set secrets.projectId=example-project --set secrets.prefix=web-store-dev
 
       - name: Render chart
         run: |
@@ -164,20 +164,25 @@ jobs:
             --set backend.image.repository=example --set backend.image.tag=ci \
             --set frontend.image.repository=example --set frontend.image.tag=ci \
             --set migration.image.repository=example --set migration.image.tag=ci \
-            --set secrets.databaseSecretName=db --set secrets.appSecretName=app \
+            --set secrets.projectId=example-project --set secrets.prefix=web-store-dev \
             > /tmp/rendered.yaml
 
       - name: Validate manifests against the Kubernetes schemas
         run: |
           curl -sSL -o /tmp/kubeconform.tar.gz \
-            https://github.com/yannh/kubeconform/releases/download/v0.6.7/kubeconform-linux-amd64.tar.gz
+            https://github.com/yannh/kubeconform/releases/download/v0.8.0/kubeconform-linux-amd64.tar.gz
           tar -xzf /tmp/kubeconform.tar.gz -C /tmp
-          # SecretProviderClass is a CRD with no published schema, hence
-          # ignore-missing-schemas; everything else is checked strictly.
-          # Keep in step with kubernetes_version in infra/ephemeral/variables.tf,
-          # so the manifests are checked against the API the cluster actually runs.
+          # SecretProviderClass and BackendConfig are CRDs with no published
+          # schema, hence ignore-missing-schemas; everything else is checked
+          # strictly.
+          #
+          # Keep in step with what the release channel in
+          # infra/ephemeral/variables.tf actually serves, so the manifests are
+          # checked against the API the cluster runs. There is no pinned
+          # cluster version to match any more — version-audit.yml compares this
+          # number against the channel's current default and warns on drift.
           /tmp/kubeconform -strict -summary -ignore-missing-schemas \
-            -kubernetes-version 1.36.0 /tmp/rendered.yaml
+            -kubernetes-version 1.35.0 /tmp/rendered.yaml
 
       - name: terraform fmt
         run: terraform fmt -check -recursive infra/

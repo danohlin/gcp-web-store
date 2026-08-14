@@ -21,9 +21,9 @@ metadata:
     helm.sh/hook: pre-install,pre-upgrade
     helm.sh/hook-weight: '-10'
     helm.sh/hook-delete-policy: before-hook-creation
-    {{- if .Values.serviceAccount.roleArn }}
-    eks.amazonaws.com/role-arn: {{ .Values.serviceAccount.roleArn | quote }}
-    {{- end }}
+# No cloud annotation: Workload Identity binds IAM to this service account by
+# namespace and name. Terraform grants it only the seven secrets below, not the
+# JWT signing keys the application service account can read.
 {{- if .Values.secrets.enabled }}
 ---
 apiVersion: secrets-store.csi.x-k8s.io/v1
@@ -38,30 +38,13 @@ metadata:
     helm.sh/hook-weight: '-10'
     helm.sh/hook-delete-policy: before-hook-creation
 spec:
-  provider: aws
+  provider: gke
   parameters:
-    region: {{ .Values.secrets.region | quote }}
-    objects: |
-      - objectName: {{ .Values.secrets.databaseSecretName | quote }}
-        objectType: secretsmanager
-        jmesPath:
-          - path: username
-            objectAlias: DB_USER
-          - path: password
-            objectAlias: DB_PASSWORD
-          - path: host
-            objectAlias: DB_HOST
-          - path: to_string(port)
-            objectAlias: DB_PORT
-          - path: dbname
-            objectAlias: DB_NAME
-      - objectName: {{ .Values.secrets.appSecretName | quote }}
-        objectType: secretsmanager
-        jmesPath:
-          - path: seedAdminPassword
-            objectAlias: SEED_ADMIN_PASSWORD
-          - path: seedCustomerPassword
-            objectAlias: SEED_CUSTOMER_PASSWORD
+    secrets: |
+      {{- range include "web-store.migrateSecretNames" . | fromJsonArray }}
+      - resourceName: "projects/{{ $.Values.secrets.projectId }}/secrets/{{ $.Values.secrets.prefix }}-{{ . | lower | replace "_" "-" }}/versions/latest"
+        path: {{ . | quote }}
+      {{- end }}
 {{- end }}
 ---
 apiVersion: batch/v1
@@ -93,7 +76,14 @@ spec:
         fsGroup: 1000
         seccompProfile:
           type: RuntimeDefault
-      {{- with .Values.nodeSelector }}
+      {{- /*
+      Deliberately migration.nodeSelector, not the shared .Values.nodeSelector
+      the Deployments use. The shared one pins pods to Spot capacity, and a
+      migration must never run there: a Spot eviction part-way through
+      `prisma migrate deploy` leaves the schema in an indeterminate state, and
+      the Job would be retried against a database it had already half-migrated.
+      */}}
+      {{- with .Values.migration.nodeSelector }}
       nodeSelector: {{- toYaml . | nindent 8 }}
       {{- end }}
       {{- with .Values.tolerations }}
@@ -156,7 +146,7 @@ spec:
         {{- if .Values.secrets.enabled }}
         - name: secrets
           csi:
-            driver: secrets-store.csi.k8s.io
+            driver: secrets-store-gke.csi.k8s.io
             readOnly: true
             volumeAttributes:
               secretProviderClass: {{ $name }}

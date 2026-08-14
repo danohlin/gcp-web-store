@@ -50,6 +50,31 @@ app.kubernetes.io/component: {{ .component }}
 {{- end -}}
 
 {{/*
+The filenames mounted under SECRETS_DIR, as a JSON array.
+
+This list is a contract with three consumers and must not drift from any of
+them:
+  backend/src/config/index.ts   reads DB_* and JWT_*
+  templates/migration.yaml      cats DB_* and SEED_* in shell
+  infra/ephemeral/secrets.tf    creates one Secret Manager secret per entry
+
+The secret id is derived from each name by lowercasing and swapping
+underscores for hyphens, so DB_PASSWORD becomes <prefix>-db-password.
+*/}}
+{{- define "web-store.appSecretNames" -}}
+["DB_USER","DB_PASSWORD","DB_HOST","DB_PORT","DB_NAME","JWT_ACCESS_SECRET","JWT_REFRESH_SECRET","SEED_ADMIN_PASSWORD","SEED_CUSTOMER_PASSWORD"]
+{{- end -}}
+
+{{/*
+The subset the migration hook needs: enough to build a DATABASE_URL and seed
+accounts. It has no business reading the JWT signing keys, and Terraform grants
+it access to these seven only.
+*/}}
+{{- define "web-store.migrateSecretNames" -}}
+["DB_USER","DB_PASSWORD","DB_HOST","DB_PORT","DB_NAME","SEED_ADMIN_PASSWORD","SEED_CUSTOMER_PASSWORD"]
+{{- end -}}
+
+{{/*
 Fully-qualified image reference. CI overrides `tag` with an immutable digest or
 a commit SHA; `latest` is deliberately not a default, because a mutable tag
 makes rollbacks meaningless.
@@ -58,7 +83,7 @@ makes rollbacks meaningless.
 {{- $repo := .repository -}}
 {{- $tag := .tag | default "" -}}
 {{- if not $repo -}}
-{{- fail "image.repository must be set (the ECR repository URI)" -}}
+{{- fail "image.repository must be set (the Artifact Registry image URI)" -}}
 {{- end -}}
 {{- if not $tag -}}
 {{- fail "image.tag must be set; refusing to deploy a floating tag" -}}

@@ -135,7 +135,10 @@ spec:
         {{- if .Values.secrets.enabled }}
         - name: secrets
           csi:
-            driver: secrets-store.csi.k8s.io
+            # The GKE managed component's driver name, not the upstream
+            # secrets-store.csi.k8s.io. Using the upstream name yields a pod
+            # stuck in ContainerCreating with "driver name not found".
+            driver: secrets-store-gke.csi.k8s.io
             readOnly: true
             volumeAttributes:
               secretProviderClass: {{ include "web-store.secretProviderClassName" . }}
@@ -150,6 +153,12 @@ metadata:
   labels:
     {{- include "web-store.labels" . | nindent 4 }}
     app.kubernetes.io/component: backend
+  {{- if .Values.ingress.enabled }}
+  annotations:
+    # Points the load balancer at /healthz rather than the pod's readinessProbe
+    # (/readyz, which touches the database). See backendconfig.yaml.
+    cloud.google.com/backend-config: '{"default":"{{ include "web-store.fullname" . }}-backend"}'
+  {{- end }}
 spec:
   type: ClusterIP
   ports:

@@ -1,5 +1,5 @@
 #!/bin/sh
-# Blocks credentials, private keys and AWS account identifiers from being
+# Blocks credentials, private keys and cloud account identifiers from being
 # committed. Enabled by `git config core.hooksPath .githooks` (see
 # scripts/install-hooks.ps1).
 #
@@ -43,8 +43,12 @@ for f in $staged; do
       note "BLOCKED  $f  — Terraform state stores secrets in plaintext"; fail=1 ;;
     *.pem|*.key|*.p12|*.pfx|*id_rsa*|*id_ed25519*)
       note "BLOCKED  $f  — looks like a private key"; fail=1 ;;
-    *kubeconfig*|*/credentials|.aws/*)
+    *kubeconfig*|*/credentials|.aws/*|.config/gcloud/*|.gcloud/*)
       note "BLOCKED  $f  — cluster or cloud credentials"; fail=1 ;;
+    application_default_credentials.json*|*/application_default_credentials.json*)
+      note "BLOCKED  $f  — gcloud ADC holds a long-lived OAuth refresh token"; fail=1 ;;
+    backend.hcl)
+      note "BLOCKED  $f  — names the state bucket, which embeds the project id"; fail=1 ;;
   esac
 done
 
@@ -69,15 +73,38 @@ scan() {
 
 # Each pattern carries the allowlist marker so that this file does not trip its
 # own scan when it is itself staged.
-scan '(AKIA|ASIA)[0-9A-Z]{16}'                      'AWS access key id'                         # pragma: allowlist secret
-scan 'aws_secret_access_key'                        'AWS secret access key assignment'          # pragma: allowlist secret
+
+# --- credentials -----------------------------------------------------------
+# A service account key JSON is the highest-value thing that can leak from a
+# GCP project: it is a long-lived credential with no expiry.
+scan '"type"[[:space:]]*:[[:space:]]*"service_account"' 'service account key JSON'              # pragma: allowlist secret
+scan '"private_key_id"'                             'service account key JSON'                  # pragma: allowlist secret
 scan 'BEGIN [A-Z ]*PRIVATE KEY'                     'private key block'                         # pragma: allowlist secret
-# ARNs and ECR hostnames both embed the 12-digit AWS account id. Terraform
-# should derive it from aws_caller_identity instead of hardcoding it.
-scan 'arn:aws[a-z-]*:[a-z0-9-]*:[a-z0-9-]*:[0-9]{12}:' 'hardcoded AWS account id in an ARN'     # pragma: allowlist secret
-scan '[0-9]{12}\.dkr\.ecr\.'                        'hardcoded AWS account id in an ECR URI'    # pragma: allowlist secret
+scan 'AIza[0-9A-Za-z_-]{35}'                        'Google API key'                            # pragma: allowlist secret
+scan 'ya29\.[0-9A-Za-z_-]{20,}'                     'Google OAuth access token'                 # pragma: allowlist secret
+scan '[0-9]+-[0-9a-z]{32}\.apps\.googleusercontent\.com' 'Google OAuth client id'               # pragma: allowlist secret
 scan 'xox[baprs]-[0-9A-Za-z-]{10,}'                 'Slack token'                               # pragma: allowlist secret
 scan 'gh[pousr]_[0-9A-Za-z]{20,}'                   'GitHub token'                              # pragma: allowlist secret
+
+# Kept from the AWS era. It costs nothing, and gitleaks ignores a bare access
+# key id, so dropping it would lose real coverage rather than dead weight.
+scan '(AKIA|ASIA)[0-9A-Z]{16}'                      'AWS access key id'                         # pragma: allowlist secret
+
+# --- account identifiers ---------------------------------------------------
+# Not secrets, but this repository is public and they name the project to
+# anyone reading it. Everything below has a derived alternative:
+# data.google_project for the number, TF_VAR_project_id for the id, and the
+# auth step's output in CI.
+#
+# Each pattern requires a literal value where an expression would normally be.
+# `[a-z]` immediately after the slash rejects Terraform's ${var...},
+# shell's ${PROJECT_ID}, Helm's {{ ... }} and a README's <project-id>, all of
+# which start with a non-letter — so the legitimate constructions do not trip
+# this and only a hardcoded value does.
+scan 'projects/[0-9]{10,14}[/"[:space:]]'           'hardcoded project number'                  # pragma: allowlist secret
+scan '[a-z0-9-]+-docker\.pkg\.dev/[a-z][a-z0-9-]{4,28}[a-z0-9]/' 'hardcoded project id in a registry URI' # pragma: allowlist secret
+scan '[a-z0-9-]+@[a-z][a-z0-9-]{4,28}\.iam\.gserviceaccount\.com' 'hardcoded service account email'       # pragma: allowlist secret
+scan '[0-9A-F]{6}-[0-9A-F]{6}-[0-9A-F]{6}'          'billing account id'                        # pragma: allowlist secret
 
 # --------------------------------------------------------------------------
 # 3. gitleaks — required, not a second opinion
