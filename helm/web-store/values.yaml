@@ -2,14 +2,14 @@
 # supplies the image tags at deploy time.
 #
 # There are no secrets in this file, and there must never be any. Everything
-# sensitive is pulled from AWS Secrets Manager by the Secrets Store CSI driver
+# sensitive is pulled from Secret Manager by the GKE Secret Manager CSI
 # and mounted as files; see `secrets` below.
 
 nameOverride: ''
 fullnameOverride: ''
 
 # --------------------------------------------------------------------- images
-# `repository` is the ECR URI, filled in from Terraform output.
+# `repository` is the Artifact Registry image URI, filled in from Terraform output.
 # `tag` has no default on purpose: the chart fails rather than deploy a
 # floating tag, because a mutable tag makes a rollback meaningless.
 backend:
@@ -53,14 +53,14 @@ frontend:
 # ---------------------------------------------------------------- application
 app:
   logLevel: info
-  # Behind an ALB the client address arrives in X-Forwarded-For; without this
-  # rate limiting would bucket every request under the load balancer.
+  # Behind the load balancer the client address arrives in X-Forwarded-For; without
+  # this, rate limiting would bucket every request under the load balancer.
   trustProxy: true
   # Requires HTTPS. Left false until a certificate is configured, otherwise the
   # browser silently drops the refresh cookie and nobody can stay signed in.
   cookieSecure: false
-  # Empty means same-origin only, which is correct when the ALB serves the SPA
-  # and the API on one hostname.
+  # Empty means same-origin only, which is correct when one load balancer serves
+  # the SPA and the API on one hostname.
   corsOrigins: ''
   shippingFlatCents: 599
   freeShippingThresholdCents: 5000
@@ -73,16 +73,18 @@ app:
 secrets:
   enabled: true
   mountPath: /mnt/secrets
-  region: us-east-1
-  # Secrets Manager names, supplied by Terraform.
-  databaseSecretName: ''
-  appSecretName: ''
+  # Supplied by Terraform (see the ephemeral stack's helm_values output). Secret
+  # ids are built as <prefix>-<filename lowercased, underscores to hyphens>, so
+  # DB_PASSWORD reads projects/<projectId>/secrets/<prefix>-db-password.
+  projectId: ''
+  prefix: ''
 
 serviceAccount:
   create: true
   name: ''
-  # IRSA role ARN, from Terraform. Grants secretsmanager:GetSecretValue.
-  roleArn: ''
+  # No roleArn equivalent. Workload Identity binds IAM to the service account by
+  # namespace and name, so there is nothing to pass in — see
+  # infra/ephemeral/secrets.tf.
 
 # ------------------------------------------------------------------ migration
 # Runs as a Helm pre-install/pre-upgrade hook, so the schema is in place before
@@ -97,7 +99,14 @@ migration:
   # destroyed nightly; must be false anywhere with real data.
   seed: true
   backoffLimit: 2
-  activeDeadlineSeconds: 600
+  # Counts from Job creation, not container start, and on Autopilot the cluster
+  # has to provision capacity for the hook Job first — one to three minutes on a
+  # cold cluster. 600 left too little headroom and failed deploys for reasons
+  # unrelated to the migration.
+  activeDeadlineSeconds: 900
+  # Empty on purpose, and deliberately not the shared nodeSelector below: the
+  # migration must never be scheduled onto Spot capacity. See migration.yaml.
+  nodeSelector: {}
   resources:
     requests:
       cpu: 100m
@@ -108,10 +117,13 @@ migration:
 # -------------------------------------------------------------------- ingress
 ingress:
   enabled: true
-  className: alb
-  # Set to serve HTTPS. Without it the ALB listens on port 80 only and
-  # app.cookieSecure must stay false.
-  certificateArn: ''
+  # The GKE Ingress controller. Provisions an external Application Load Balancer
+  # out of band, which is why teardown order matters — see NOTES.txt.
+  className: gce
+  # Name of a ManagedCertificate object to serve HTTPS. Without it the load
+  # balancer listens on port 80 only and app.cookieSecure must stay false.
+  # Needs a domain pointed at the load balancer's IP first.
+  managedCertificateName: ''
   host: ''
   annotations: {}
 

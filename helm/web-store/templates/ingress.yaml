@@ -7,26 +7,19 @@ metadata:
   labels:
     {{- include "web-store.labels" . | nindent 4 }}
   annotations:
-    alb.ingress.kubernetes.io/scheme: internet-facing
-    # `ip` targets pods directly, skipping the NodePort hop. Required for
-    # Fargate and better for rolling updates on EC2 nodes.
-    alb.ingress.kubernetes.io/target-type: ip
-    alb.ingress.kubernetes.io/healthcheck-path: /healthz
-    alb.ingress.kubernetes.io/healthcheck-interval-seconds: '15'
-    alb.ingress.kubernetes.io/success-codes: '200'
-    # Deregistration delay: the ALB stops sending traffic before the pod's
-    # 30s grace period expires, so a rollout drops no requests.
-    alb.ingress.kubernetes.io/target-group-attributes: deregistration_delay.timeout_seconds=20
-    {{- if .Values.ingress.certificateArn }}
-    alb.ingress.kubernetes.io/listen-ports: '[{"HTTP": 80}, {"HTTPS": 443}]'
-    alb.ingress.kubernetes.io/certificate-arn: {{ .Values.ingress.certificateArn | quote }}
-    alb.ingress.kubernetes.io/ssl-redirect: '443'
-    alb.ingress.kubernetes.io/ssl-policy: ELBSecurityPolicy-TLS13-1-2-2021-06
+    # The GKE Ingress controller provisions an external Application Load
+    # Balancer out of band. Nothing in Terraform knows about it, which is why
+    # the teardown order in scripts/down.ps1 matters — see NOTES.txt.
+    #
+    # Health checks are not configured here as they were with the ALB
+    # annotations. Container-native load balancing derives them from the
+    # backend Service's BackendConfig instead; see backendconfig.yaml.
+    {{- if .Values.ingress.managedCertificateName }}
+    networking.gke.io/managed-certificates: {{ .Values.ingress.managedCertificateName | quote }}
     {{- else }}
-    # No certificate configured, so the ALB serves plain HTTP on the
-    # *.elb.amazonaws.com hostname. Set ingress.certificateArn (and a domain)
-    # to enable TLS — and only then set app.cookieSecure.
-    alb.ingress.kubernetes.io/listen-ports: '[{"HTTP": 80}]'
+    # No certificate configured, so the load balancer serves plain HTTP on its
+    # raw IP. Set ingress.managedCertificateName (and a domain) to enable TLS —
+    # and only then set app.cookieSecure.
     {{- end }}
     {{- with .Values.ingress.annotations }}
     {{- toYaml . | nindent 4 }}
@@ -39,8 +32,11 @@ spec:
       {{- end }}
       http:
         paths:
-          # /api must come first: the ALB evaluates rules in order, and the
-          # catch-all below would otherwise swallow every API request.
+          # Order is cosmetic here. Google Cloud Load Balancing URL maps match
+          # by longest prefix, so /api wins over / regardless of position. The
+          # ALB this replaced evaluated rules in order, which made the ordering
+          # load-bearing and made SetRulePriorities a permission the controller
+          # had to hold.
           - path: /api
             pathType: Prefix
             backend:

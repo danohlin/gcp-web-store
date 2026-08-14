@@ -1,0 +1,60 @@
+{{- if .Values.ingress.enabled }}
+{{- $fullName := include "web-store.fullname" . -}}
+#
+# Load balancer health checks.
+#
+# This file exists to preserve a deliberate choice that the ALB annotations
+# used to express directly. With container-native load balancing, Google Cloud
+# derives the health check from the backend pod's *readinessProbe* unless a
+# BackendConfig says otherwise — and the backend's readinessProbe is /readyz,
+# which runs SELECT 1 against the database.
+#
+# Left at the default, a brief database blip would fail the load balancer
+# health check and pull every backend out of rotation, turning a recoverable
+# database hiccup into a total outage. The ALB was explicitly pointed at
+# /healthz for exactly this reason. Same intent, different mechanism.
+#
+# Kubernetes keeps using /readyz to decide which pods receive traffic, which is
+# the right behaviour there: a pod that cannot reach the database should not be
+# sent requests, even while the load balancer keeps the backend service up.
+apiVersion: cloud.google.com/v1
+kind: BackendConfig
+metadata:
+  name: {{ $fullName }}-backend
+  labels:
+    {{- include "web-store.labels" . | nindent 4 }}
+spec:
+  healthCheck:
+    type: HTTP
+    requestPath: /healthz
+    port: 4000
+    checkIntervalSec: 15
+    timeoutSec: 5
+    healthyThreshold: 1
+    unhealthyThreshold: 3
+  # The load balancer stops sending traffic before the pod's 30s grace period
+  # expires, so a rollout drops no requests. Replaces the ALB's
+  # deregistration_delay.timeout_seconds=20.
+  connectionDraining:
+    drainingTimeoutSec: 20
+---
+apiVersion: cloud.google.com/v1
+kind: BackendConfig
+metadata:
+  name: {{ $fullName }}-frontend
+  labels:
+    {{- include "web-store.labels" . | nindent 4 }}
+spec:
+  healthCheck:
+    type: HTTP
+    # nginx serves this directly and never calls the backend, so the frontend
+    # stays healthy independently of the API.
+    requestPath: /healthz
+    port: 8080
+    checkIntervalSec: 15
+    timeoutSec: 5
+    healthyThreshold: 1
+    unhealthyThreshold: 3
+  connectionDraining:
+    drainingTimeoutSec: 20
+{{- end }}

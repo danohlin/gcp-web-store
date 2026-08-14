@@ -1,7 +1,7 @@
 # Throwaway environment: created in the morning, destroyed at the end of the
 # day. Sized down accordingly, and reseeded on every deploy.
 #
-# Repositories, secret names and the IRSA role ARN come from Terraform outputs;
+# Image repositories and the secret project/prefix come from Terraform outputs;
 # the up script fills them in. Image tags come from CI.
 
 backend:
@@ -20,15 +20,21 @@ frontend:
   autoscaling:
     enabled: false
   resources:
+    # Autopilot enforces a floor of 50m CPU and 52Mi memory per container, and a
+    # memory:CPU ratio of at least 1:1. The previous 10m/32Mi breached both, so
+    # Autopilot silently rewrote them — these values are what actually gets
+    # scheduled, and are stated explicitly so the manifest tells the truth.
+    #
+    # Note you are billed on the request, so bursting above it is not free.
     requests:
-      cpu: 10m
-      memory: 32Mi
+      cpu: 50m
+      memory: 52Mi
     limits:
       memory: 96Mi
 
 app:
   logLevel: debug
-  # No certificate on the ALB's default hostname, so cookies cannot be Secure.
+  # No certificate on the load balancer's raw IP, so cookies cannot be Secure.
   cookieSecure: false
 
 migration:
@@ -39,6 +45,18 @@ migration:
 podDisruptionBudget:
   enabled: false
 
-# No tolerations needed: the node group carries no taint. See the comment in
-# infra/ephemeral/eks.tf for why the spot taint was removed.
+# Spot Pods: 60-91% cheaper, and correct for an environment rebuilt daily.
+#
+# This applies to the Deployments only. The migration Job has its own
+# migration.nodeSelector, left empty on purpose — see migration.yaml.
+#
+# Autopilot manages system workloads itself, so the CoreDNS-stuck-Pending
+# failure that forced the spot taint out of the EKS stack has no counterpart
+# here and no toleration is needed. What does carry over is the eviction
+# window: Spot Pods get 25 seconds' notice against a
+# terminationGracePeriodSeconds of 30, so a pod can be killed part-way through
+# draining.
+nodeSelector:
+  cloud.google.com/gke-spot: 'true'
+
 tolerations: []

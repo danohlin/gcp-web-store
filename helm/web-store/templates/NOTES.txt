@@ -2,20 +2,20 @@
 
 {{- if .Values.ingress.enabled }}
 
-The AWS Load Balancer Controller provisions the ALB out of band, so the address
-takes a minute or two to appear:
+The GKE Ingress controller provisions a Google Cloud external Application Load
+Balancer out of band, so the address takes a few minutes to appear:
 
   kubectl get ingress {{ include "web-store.fullname" . }} -n {{ .Release.Namespace }} -w
 
 Then open:
 {{- if .Values.ingress.host }}
-  http{{ if .Values.ingress.certificateArn }}s{{ end }}://{{ .Values.ingress.host }}
+  http{{ if .Values.ingress.managedCertificateName }}s{{ end }}://{{ .Values.ingress.host }}
 {{- else }}
   http://<the ADDRESS shown above>
 {{- end }}
 {{- end }}
 
-{{- if not .Values.ingress.certificateArn }}
+{{- if not .Values.ingress.managedCertificateName }}
 
 NOTE: no certificate is configured, so traffic is plain HTTP and
 app.cookieSecure is {{ .Values.app.cookieSecure }}. Do not set cookieSecure=true
@@ -34,11 +34,14 @@ Check rollout status:
   kubectl rollout status deploy/{{ include "web-store.fullname" . }}-backend -n {{ .Release.Namespace }}
   kubectl rollout status deploy/{{ include "web-store.fullname" . }}-frontend -n {{ .Release.Namespace }}
 
-IMPORTANT — teardown order. The ALB and its security groups are created by the
-controller, not by Terraform. Deleting the cluster or VPC first strands network
-interfaces that block the VPC from being destroyed, and `terraform destroy`
-then hangs for ~20 minutes before failing. Always remove this release and wait
-for the ALB to disappear before destroying infrastructure:
+IMPORTANT — teardown order. The load balancer, its forwarding rule, URL map,
+backend services, health checks and firewall rules are created by the GKE
+Ingress controller, not by Terraform, which knows nothing about them. Deleting
+the cluster first orphans all of it, and an orphaned global forwarding rule
+keeps billing at roughly $0.025/hr indefinitely. Always remove this release and
+wait for the load balancer to disappear before destroying infrastructure:
 
   helm uninstall {{ .Release.Name }} -n {{ .Release.Namespace }}
   kubectl wait --for=delete ingress/{{ include "web-store.fullname" . }} -n {{ .Release.Namespace }} --timeout=5m
+
+scripts/down.ps1 does this in the right order and then sweeps for leftovers.
