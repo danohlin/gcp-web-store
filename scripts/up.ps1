@@ -1,3 +1,18 @@
+# PowerShell 7+, not Windows PowerShell 5.1. Both are usually on PATH, as
+# `pwsh` and `powershell` respectively, and picking the wrong one fails in a
+# way that reads like a cloud problem rather than a shell one.
+#
+# 5.1 turns a native command's stderr into a terminating error under
+# $ErrorActionPreference = 'Stop'. gcloud writes ordinary progress to stderr —
+# "Fetching cluster endpoint and auth data." — so `gcloud ... 2>&1 | Out-Null`
+# below aborts the script on a *successful* command, roughly eight minutes in,
+# after the apply and the image pushes, quoting that success message as the
+# error. 7.3+ does not do this. Verified by running the identical redirect
+# under both.
+#
+# Without this line the run dies mid-flight with the cluster already billing.
+#Requires -Version 7.0
+
 <#
 .SYNOPSIS
   Builds the whole environment in GCP: infrastructure and the application.

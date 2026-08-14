@@ -48,6 +48,8 @@ spec:
                   matchLabels:
                     {{- include "web-store.selectorLabels" (dict "root" . "component" "frontend") | nindent 20 }}
       {{- end }}
+      # Autopilot rewrites this to 25 under the Spot toleration that
+      # values-dev.yaml adds — see the note in backend.yaml.
       terminationGracePeriodSeconds: 30
       containers:
         - name: frontend

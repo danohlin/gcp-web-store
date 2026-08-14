@@ -54,6 +54,12 @@ spec:
       {{- end }}
       # Long enough for in-flight requests to drain; server.ts closes the HTTP
       # server on SIGTERM and forces exit after 15s.
+      #
+      # Autopilot rewrites this to 25 whenever the pod carries the Spot
+      # toleration, which values-dev.yaml adds — 25 is the documented maximum
+      # there. Verified on a real cluster: the admitted pods report 25, not the
+      # 30 written here. Harmless, because the server gives up at 15s either
+      # way, but the number below is not what runs in the dev environment.
       terminationGracePeriodSeconds: 30
       containers:
         - name: backend
