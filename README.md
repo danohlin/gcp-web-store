@@ -164,17 +164,31 @@ per clone):
 .\scripts\install-hooks.ps1
 ```
 
+Put your project id in `infra/persistent/terraform.tfvars` and
+`infra/ephemeral/terraform.tfvars` (both gitignored), or export
+`TF_VAR_project_id`.
+
 Bootstrap the persistent stack. It creates the bucket its own state later lives
-in, so the first apply runs with a local backend and migrates afterwards:
+in, so the first apply runs against local state and migrates afterwards.
+`-backend=false` is **not** sufficient — it leaves no backend record and both
+plan and apply then fail with "Backend initialization required". Use a throwaway
+override instead; `*_override.tf` is gitignored for exactly this:
 
 ```powershell
 cd infra/persistent
-terraform init -backend=false
+'terraform { backend "local" {} }' | Set-Content backend_override.tf
+terraform init -reconfigure
 terraform apply
-terraform init -migrate-state `
-  -backend-config="bucket=web-store-tfstate-$(gcloud config get-value project)" `
+
+$bucket = terraform output -raw state_bucket    # read it BEFORE deleting the override
+Remove-Item backend_override.tf
+terraform init -migrate-state -force-copy `
+  -backend-config="bucket=$bucket" `
   -backend-config="prefix=persistent"
 ```
+
+Once the override is gone, `terraform output` can no longer reach the state to
+tell you the bucket name — hence reading it first.
 
 Then add two GitHub repository **variables** (Settings → Secrets and variables →
 Actions → Variables):

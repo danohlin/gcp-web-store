@@ -112,12 +112,14 @@ resource "google_artifact_registry_repository" "this" {
   format        = "DOCKER"
   description   = "Container images for ${var.project}"
 
-  docker_config {
-    # Mutable on purpose. CI tags by commit SHA, which is already effectively
-    # immutable, and IMMUTABLE_TAGS would make a re-run of the same commit fail
-    # on push rather than succeed idempotently.
-    immutable_tags = false
-  }
+  # Tags are mutable, which is the default and is therefore left unset rather
+  # than stated. CI tags by commit SHA — already effectively immutable — and
+  # turning immutable_tags on would make a re-run of the same commit fail on
+  # push instead of succeeding idempotently.
+  #
+  # Setting it explicitly to false produces a perpetual diff: the API omits
+  # docker_config when it holds only defaults, so every plan proposes adding
+  # the block back.
 
   # Expire untagged images quickly; they are build leftovers.
   #
