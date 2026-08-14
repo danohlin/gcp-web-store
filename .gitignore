@@ -45,11 +45,13 @@ override.tf.json
 *_override.tf.json
 tfplan
 *.tfplan
-# Backend configs name the state bucket, which embeds the AWS account id.
+# Backend configs name the state bucket, which embeds the project id.
 backend.hcl
 !backend.hcl.example
 
 # --- Cloud / cluster credentials ---
+# .aws/ stays even though this project is GCP-only. It costs nothing, and a
+# developer machine that has ever touched AWS still has one.
 .aws/
 credentials
 *.kubeconfig

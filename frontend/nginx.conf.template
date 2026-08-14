@@ -5,7 +5,7 @@ server {
     root /usr/share/nginx/html;
     index index.html;
 
-    # Behind an ALB the real client address arrives in X-Forwarded-For.
+    # Behind the load balancer the real client address arrives in X-Forwarded-For.
     real_ip_header X-Forwarded-For;
     set_real_ip_from 0.0.0.0/0;
 
@@ -30,8 +30,8 @@ server {
 
     # --- api ----------------------------------------------------------------
     # Proxied rather than called cross-origin, which keeps the refresh and cart
-    # cookies first-party. In EKS the ALB also routes /api straight to the
-    # backend; both paths preserve the same origin.
+    # cookies first-party. In the cluster the load balancer also routes /api
+    # straight to the backend; both paths preserve the same origin.
     #
     # No security-headers include here on purpose: these are the API's own
     # responses, and the backend sets its headers via helmet.

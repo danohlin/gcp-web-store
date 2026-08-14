@@ -28,10 +28,9 @@ function resolve(name: string): string | undefined {
 }
 
 /**
- * The RDS-managed secret in AWS Secrets Manager is a JSON document. The CSI
- * driver splits it into one file per key, so the connection string is assembled
- * here rather than being stored as a whole. A directly supplied DATABASE_URL
- * (local dev, CI) always wins.
+ * Secret Manager holds one secret per value, and the CSI driver mounts each as
+ * its own file, so the connection string is assembled here rather than being
+ * stored whole. A directly supplied DATABASE_URL (local dev, CI) always wins.
  */
 function resolveDatabaseUrl(): string | undefined {
   const direct = resolve('DATABASE_URL');

@@ -3,18 +3,42 @@ import { PrismaClient } from '@prisma/client';
 import { hash, Algorithm } from '@node-rs/argon2';
 
 /**
- * Idempotent seed. The ephemeral AWS environment is destroyed and recreated
- * daily, so this runs on every spin-up and must converge rather than duplicate.
+ * Idempotent seed. The ephemeral environment is destroyed and recreated daily,
+ * so this runs on every spin-up and must converge rather than duplicate.
  *
- * Seed account passwords come from the environment. The defaults below are
- * development-only; the Helm chart supplies real values from Secrets Manager.
+ * Seed account passwords come from the environment. The migration Job reads
+ * them from the files the Secret Manager CSI driver mounts and exports them
+ * before invoking this.
  */
 const prisma = new PrismaClient();
 
+/**
+ * Development defaults are a convenience for `docker compose`, and a liability
+ * anywhere else: these values are published in this repository, so falling back
+ * to them in production would seed a real admin account with a password anyone
+ * can read.
+ *
+ * Previously they were a plain `??` default, which meant a missing or failed
+ * secret mount degraded silently into exactly that. Fail instead — a migration
+ * that stops is recoverable, an account with a known password is not.
+ */
+function seedSecret(name: string, devDefault: string): string {
+  const value = process.env[name];
+  if (value) return value;
+
+  if (process.env.NODE_ENV === 'production') {
+    throw new Error(
+      `${name} is not set. Refusing to seed with the development default in production — ` +
+        'it is published in the repository. Check that the secret volume mounted.',
+    );
+  }
+  return devDefault;
+}
+
 const ADMIN_EMAIL = process.env.SEED_ADMIN_EMAIL ?? 'admin@web-store.local';
-const ADMIN_PASSWORD = process.env.SEED_ADMIN_PASSWORD ?? 'ChangeMe-Admin-123';
+const ADMIN_PASSWORD = seedSecret('SEED_ADMIN_PASSWORD', 'ChangeMe-Admin-123');
 const CUSTOMER_EMAIL = process.env.SEED_CUSTOMER_EMAIL ?? 'customer@web-store.local';
-const CUSTOMER_PASSWORD = process.env.SEED_CUSTOMER_PASSWORD ?? 'ChangeMe-Customer-123';
+const CUSTOMER_PASSWORD = seedSecret('SEED_CUSTOMER_PASSWORD', 'ChangeMe-Customer-123');
 
 function hashPassword(plain: string): Promise<string> {
   return hash(plain, {

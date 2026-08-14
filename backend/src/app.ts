@@ -22,8 +22,9 @@ import { adminRouter } from './modules/admin/admin.routes.js';
 export function createApp(): Express {
   const app = express();
 
-  // Behind an ALB, the client IP and protocol arrive in X-Forwarded-*. Without
-  // this, rate limiting would bucket every request under the load balancer.
+  // Behind the load balancer, the client IP and protocol arrive in
+  // X-Forwarded-*. Without this, rate limiting would bucket every request
+  // under the load balancer.
   if (config.trustProxy) app.set('trust proxy', true);
 
   app.disable('x-powered-by');
@@ -58,7 +59,7 @@ export function createApp(): Express {
     }),
   );
 
-  // ---- probes (outside /api so the ALB can reach them directly) ----------
+  // ---- probes (outside /api so the load balancer reaches them directly) --
 
   // Liveness: process is up. Must not touch the database, or a brief DB blip
   // would cause Kubernetes to kill otherwise-healthy pods.
