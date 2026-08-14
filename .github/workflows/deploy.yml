@@ -39,7 +39,7 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # No service account keys anywhere. GitHub mints a short-lived token, GCP
       # trades it for an impersonated access token, and it expires when the job
@@ -88,10 +88,10 @@ jobs:
       - name: Log in to Artifact Registry
         run: gcloud auth configure-docker "${REGION}-docker.pkg.dev" --quiet
 
-      - uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-buildx-action@v4
 
       - name: Build and push backend
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: ./backend
           target: runtime
@@ -103,7 +103,7 @@ jobs:
           cache-to: type=gha,mode=max
 
       - name: Build and push migrator
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: ./backend
           target: migrator
@@ -115,7 +115,7 @@ jobs:
           cache-to: type=gha,mode=max
 
       - name: Build and push frontend
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: ./frontend
           push: true
@@ -139,7 +139,7 @@ jobs:
             echo "::notice::Cluster ${{ steps.names.outputs.cluster }} is not running. Images pushed; skipping deploy."
           fi
 
-      - uses: azure/setup-helm@v4
+      - uses: azure/setup-helm@v5
         if: steps.cluster.outputs.exists == 'true'
 
       - name: Configure kubectl

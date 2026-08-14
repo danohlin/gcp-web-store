@@ -34,7 +34,7 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # Read-only GCP access, needed for the GKE channel and Cloud SQL version
       # lookups. Uses the same service account as deploys; it can describe but
