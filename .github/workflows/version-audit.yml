@@ -49,6 +49,13 @@ jobs:
 
       - name: Audit
         id: audit
+        env:
+          # The action-runtime check reads each pinned action's metadata
+          # through the API. Unauthenticated calls are capped at 60 an hour
+          # per IP, shared across every runner GitHub happens to schedule
+          # this on, so it would fail intermittently and for no visible
+          # reason without a token.
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -uo pipefail
           FINDINGS=""
@@ -196,6 +203,87 @@ jobs:
           if [ -n "$NGINX_LATEST" ] && [ "$NGINX_PIN" != "$NGINX_LATEST" ]; then
             note "nginx is pinned at ${NGINX_PIN}; ${NGINX_LATEST} is available. It is the only internet-facing component, so security fixes matter."
           fi
+
+          # ---------------------------------------------------------------
+          # Action runtimes.
+          #
+          # Every `uses:` pin is a literal that nothing re-checks. Seven of
+          # them ended up a full runtime generation behind because they were
+          # inherited from the repository this project was imported from and
+          # carried forward unexamined, while every action written here from
+          # scratch was current. GitHub force-upgrades a deprecated runtime
+          # and annotates the job instead of failing it, so the only symptom
+          # is a warning nobody reads.
+          #
+          # The floor is raised by hand when GitHub deprecates the next
+          # runtime. There is no API that answers "is this runtime dead", so
+          # inferring one would mean guessing.
+          NODE_FLOOR=24
+
+          # Anchored to the YAML key, because this grep reads the directory
+          # that contains this file and the pattern below is itself a literal
+          # string in it. Unanchored, the expression matched its own source
+          # and tried to resolve a regex as though it were an action — the
+          # same self-reference trap as the `default` heredoc above.
+          #
+          # Leading [^.] skips local actions (./path), which have no upstream
+          # to resolve and would each cost a wasted API call.
+          ACTIONS=$(grep -rhoE '^[[:space:]]*-?[[:space:]]*uses:[[:space:]]*[^.][^@[:space:]]+@[^[:space:]]+' .github/workflows/*.yml \
+                    | sed -E 's/^[[:space:]]*-?[[:space:]]*uses:[[:space:]]*//' | sort -u)
+          if [ -z "$ACTIONS" ]; then
+            echo "::error::Extracted no action pins from .github/workflows. The pattern no longer matches."
+            exit 1
+          fi
+
+          RT_CHECKED=0
+          for a in $ACTIONS; do
+            repo="${a%@*}"; ref="${a##*@}"; meta=""
+            for f in action.yml action.yaml; do
+              # Assigned inside the `if` on purpose. `gh api` prints its 404
+              # body to stdout and exits 1, so a plain assignment leaves the
+              # error JSON in the variable and the ref reads as resolved.
+              if body=$(gh api "repos/${repo}/contents/${f}?ref=${ref}" \
+                          -H "Accept: application/vnd.github.raw" 2>/dev/null); then
+                meta="$body"; break
+              fi
+            done
+
+            if [ -z "$meta" ]; then
+              echo "::warning::Could not read action metadata for ${a}; not checked."
+              continue
+            fi
+
+            using=$(printf '%s' "$meta" \
+                    | grep -m1 -oE "using:[[:space:]]*['\"]?[a-zA-Z0-9]+" \
+                    | sed -E "s/using:[[:space:]]*['\"]?//")
+
+            # Not every action declares one — first-party actions can use an
+            # internal `plugin:` block instead. Unknown is reported as
+            # unknown rather than counted as passing.
+            if [ -z "$using" ]; then
+              echo "::warning::${a} declares no runs.using; not checked."
+              continue
+            fi
+
+            RT_CHECKED=$((RT_CHECKED + 1))
+            echo "  ${a} -> ${using}"
+
+            # Composite and docker actions have no Node runtime to age out.
+            major=$(printf '%s' "$using" | grep -oE '[0-9]+$' || true)
+            if printf '%s' "$using" | grep -q '^node' \
+               && [ -n "$major" ] && [ "$major" -lt "$NODE_FLOOR" ]; then
+              note "\`${a}\` runs on ${using}, which GitHub has deprecated. It is being force-upgraded at run time; that fallback will not last."
+            fi
+          done
+
+          # Every pin failing to resolve looks identical to every pin being
+          # fine, and this check exists precisely because that distinction
+          # went unnoticed for a whole migration.
+          if [ "$RT_CHECKED" -eq 0 ]; then
+            echo "::error::Resolved the runtime of no action at all. The API calls or the parse are broken."
+            exit 1
+          fi
+          echo "action runtimes checked=$RT_CHECKED floor=node${NODE_FLOOR}"
 
           # ---------------------------------------------------------------
           {
