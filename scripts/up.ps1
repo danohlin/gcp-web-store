@@ -1,22 +1,31 @@
 <#
 .SYNOPSIS
-  Builds the whole environment in AWS: infrastructure, cluster add-ons, and the
-  application.
+  Builds the whole environment in GCP: infrastructure and the application.
 
 .DESCRIPTION
-  Expect roughly 20 minutes, dominated by the EKS control plane. Run down.ps1
-  when finished for the day; nothing here survives that.
+  Expect roughly 15 minutes, dominated by the GKE control plane and Cloud SQL.
+  Run down.ps1 when finished for the day; nothing here survives that.
 
-  Cluster add-ons are installed with helm from this script rather than through
-  Terraform's helm provider. Configuring a provider from resources created in
-  the same apply is a well-known bootstrapping trap that fails on first run, and
-  keeping the ordering explicit here also makes teardown ordering obvious.
+  Notably shorter than its AWS predecessor, which had a whole "cluster add-ons"
+  stage installing three Helm charts imperatively. None of that survives:
+
+    AWS Load Balancer Controller  the GKE Ingress controller is part of the
+                                  control plane
+    Secrets Store CSI driver      replaced by secret_manager_config in the
+       + AWS provider chart       Terraform cluster resource. The upstream
+                                  driver cannot run on Autopilot at all — its
+                                  DaemonSet needs privileged write-mode
+                                  hostPath mounts, which Autopilot forbids.
+
+  With them went three pinned chart versions, an IRSA annotation applied by
+  kubectl because the chart exposed no value for it, and a mandatory rollout
+  restart working around a webhook certificate the chart re-minted on every run.
 
 .PARAMETER SkipInfra
   Reuse existing infrastructure and only redeploy the application.
 
 .PARAMETER SkipBuild
-  Do not rebuild or push images; deploy whatever tag is already in ECR.
+  Do not rebuild or push images; deploy whatever tag is already in the registry.
 
 .EXAMPLE
   .\scripts\up.ps1
@@ -31,26 +40,6 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
-
-<#
-Cluster add-on chart versions, pinned deliberately.
-
-Installing "whatever is latest today" makes a daily rebuild non-reproducible:
-a green run proves nothing about tomorrow, because an upstream release lands
-without any change on your side.
-
-The ALB controller pin is load-bearing beyond reproducibility. Its IAM policy is
-vendored at infra/ephemeral/policies/ and must match the controller version. The
-two drifted once already — the policy sat at v2.11.0 while the chart floated to
-v3.5.0, which withholds four permissions the newer controller needs, including
-elasticloadbalancing:SetRulePriorities. That is how the ALB orders routing
-rules, so /api would have stopped taking precedence over the catch-all.
-
-When bumping ALB_CHART_VERSION, re-vendor the policy from the matching tag.
-#>
-$ALB_CHART_VERSION        = '3.5.0'
-$CSI_DRIVER_CHART_VERSION = '1.6.0'
-$CSI_AWS_CHART_VERSION    = '3.1.2'
 
 $repoRoot = git rev-parse --show-toplevel
 Set-Location $repoRoot
@@ -101,6 +90,9 @@ lock" until it is cleared by hand.
 This clears a lock only when no terraform process is running locally, which is
 the signature of an abandoned run rather than a concurrent one. It deliberately
 does not force past a live operation.
+
+Still needed on GCS. The backend locks natively rather than through a separate
+table, but an interrupted run leaves the .tflock object behind just the same.
 #>
 function Clear-StaleLock {
   param([string]$Output)
@@ -124,27 +116,38 @@ $started = Get-Date
 
 # ---------------------------------------------------------------------------
 Step 'Checking prerequisites'
-foreach ($tool in 'terraform', 'aws', 'kubectl', 'helm', 'docker') {
+foreach ($tool in 'terraform', 'gcloud', 'kubectl', 'helm', 'docker') {
   if (-not (Get-Command $tool -ErrorAction SilentlyContinue)) {
     throw "$tool is not on PATH."
   }
 }
-$identity = aws sts get-caller-identity --output json | ConvertFrom-Json
-if (-not $?) { throw 'AWS credentials are not configured. Run: aws configure --profile terraform-deployer' }
-Ok "Authenticated as $($identity.Arn)"
+
+$projectId = (gcloud config get-value project 2>$null)
+if (-not $projectId -or $projectId -eq '(unset)') {
+  throw 'No GCP project is configured. Run: gcloud config set project <PROJECT_ID>'
+}
+$account = (gcloud config get-value account 2>$null)
+if (-not $account -or $account -eq '(unset)') {
+  throw 'Not authenticated. Run: gcloud auth login; gcloud auth application-default login'
+}
+Ok "Authenticated as $account on project $projectId"
+
+# Terraform reads this rather than a committed tfvars, so the project id never
+# lands in the repository.
+$env:TF_VAR_project_id = $projectId
 
 # ---------------------------------------------------------------------------
-Step 'Persistent stack (state bucket + ECR)'
+Step 'Persistent stack (state bucket + Artifact Registry)'
 Push-Location $persistentDir
 try {
   # Backend config is derived rather than committed: the bucket name embeds the
-  # account id, and this repository is public.
+  # project id, and this repository is public.
+  #
+  # No encrypt or use_lockfile as there were on S3 — GCS always encrypts at rest
+  # and locks natively.
   terraform init -input=false -reconfigure `
-    -backend-config="bucket=web-store-tfstate-$($identity.Account)" `
-    -backend-config="key=persistent/terraform.tfstate" `
-    -backend-config="region=us-east-1" `
-    -backend-config="encrypt=true" `
-    -backend-config="use_lockfile=true" | Out-Null
+    -backend-config="bucket=web-store-tfstate-$projectId" `
+    -backend-config="prefix=persistent" | Out-Null
   if ($LASTEXITCODE -ne 0) { throw 'persistent terraform init failed' }
 
   # Not piped to Out-Null: PowerShell turns a native command's stderr into a
@@ -154,34 +157,26 @@ try {
   if ($LASTEXITCODE -ne 0) { throw 'persistent terraform apply failed' }
 
   $stateBucket = terraform output -raw state_bucket
-  $registry = terraform output -raw ecr_registry
+  $registryHost = terraform output -raw artifact_registry_host
   $region = terraform output -raw region
-  $repos = terraform output -json ecr_repository_urls | ConvertFrom-Json
-  $ciRoleArn = terraform output -raw github_actions_role_arn
+  $repos = terraform output -json image_repos | ConvertFrom-Json
   Ok "State bucket: $stateBucket"
 } finally { Pop-Location }
 
 # ---------------------------------------------------------------------------
-Step 'Ephemeral stack (VPC, EKS, RDS)'
-Info 'This is the slow part - the EKS control plane alone takes ~10 minutes.'
+Step 'Ephemeral stack (VPC, GKE Autopilot, Cloud SQL)'
+Info 'This is the slow part - the cluster and database take ~10 minutes between them.'
 Push-Location $ephemeralDir
 try {
-  # The backend is configured on the command line rather than committed,
-  # because the bucket name embeds the account id.
   terraform init -input=false -reconfigure `
     -backend-config="bucket=$stateBucket" `
-    -backend-config="key=ephemeral/terraform.tfstate" `
-    -backend-config="region=$region" `
-    -backend-config="encrypt=true" `
-    -backend-config="use_lockfile=true" | Out-Null
+    -backend-config="prefix=ephemeral" | Out-Null
   if ($LASTEXITCODE -ne 0) { throw 'terraform init failed' }
 
-  # Grant the CI role cluster access. IAM permissions alone give it nothing
-  # inside Kubernetes; without this access entry, GitHub Actions authenticates
-  # to AWS successfully and is then refused by the cluster.
-  # Passed as TF_VAR_ rather than -var to avoid quoting a JSON list through
-  # PowerShell's argument parser.
-  $env:TF_VAR_cluster_admin_principals = (ConvertTo-Json @($ciRoleArn) -Compress)
+  # No equivalent of the EKS access-entry dance here. On EKS, IAM permissions
+  # alone gave CI nothing inside the cluster and a separate access entry had to
+  # name its role. GKE maps IAM to Kubernetes RBAC directly, so the
+  # container.developer role granted in the persistent stack is sufficient.
 
   if (-not $SkipInfra) {
     $apply = Invoke-Terraform apply -auto-approve -input=false
@@ -199,9 +194,8 @@ try {
   }
 
   $tf = @{}
-  foreach ($k in 'cluster_name', 'region', 'namespace', 'alb_controller_role_arn',
-    'csi_driver_role_arn', 'app_role_arn', 'database_secret_name',
-    'app_secret_name', 'vpc_id') {
+  foreach ($k in 'cluster_name', 'cluster_location', 'region', 'namespace',
+    'project_id', 'secret_prefix', 'database_host') {
     $tf[$k] = terraform output -raw $k
   }
   $cost = terraform output -raw estimated_hourly_usd
@@ -212,99 +206,13 @@ Info "Cost while running: $cost"
 
 # ---------------------------------------------------------------------------
 Step 'Configuring kubectl'
-aws eks update-kubeconfig --name $tf.cluster_name --region $tf.region | Out-Null
-kubectl get nodes --no-headers | ForEach-Object { Info $_ }
+gcloud container clusters get-credentials $tf.cluster_name --region $tf.cluster_location --project $tf.project_id 2>&1 | Out-Null
+if ($LASTEXITCODE -ne 0) { throw 'could not get cluster credentials' }
 
-# ---------------------------------------------------------------------------
-Step 'Cluster add-ons'
-
-Info 'AWS Load Balancer Controller...'
-helm repo add eks https://aws.github.io/eks-charts 2>&1 | Out-Null
-helm repo add secrets-store-csi-driver https://kubernetes-sigs.github.io/secrets-store-csi-driver/charts 2>&1 | Out-Null
-helm repo add aws-secrets-manager https://aws.github.io/secrets-store-csi-driver-provider-aws 2>&1 | Out-Null
-helm repo update 2>&1 | Out-Null
-
-helm upgrade --install aws-load-balancer-controller eks/aws-load-balancer-controller `
-  --version $ALB_CHART_VERSION `
-  --namespace kube-system `
-  --set clusterName=$($tf.cluster_name) `
-  --set serviceAccount.create=true `
-  --set serviceAccount.name=aws-load-balancer-controller `
-  --set "serviceAccount.annotations.eks\.amazonaws\.com/role-arn=$($tf.alb_controller_role_arn)" `
-  --set region=$($tf.region) `
-  --set vpcId=$($tf.vpc_id) `
-  --wait --timeout 5m | Out-Null
-if ($LASTEXITCODE -ne 0) { throw 'ALB controller install failed' }
-
-<#
-Restart the controller after every upgrade.
-
-The chart mints a self-signed webhook certificate on each helm run, updating
-both the TLS secret and the caBundle in the webhook configuration. The pods do
-not restart, because the Deployment spec itself has not changed — so they keep
-serving the certificate mounted at their original start, which no longer
-matches the CA the API server now expects.
-
-Nothing breaks until the next deploy, and then everything does: the webhook
-intercepts every Service admission, so the whole release fails with
-
-  failed calling webhook "mservice.elbv2.k8s.aws": x509: certificate signed by
-  unknown authority
-
-which reads like a cluster CA problem rather than a stale pod.
-#>
-kubectl rollout restart deployment aws-load-balancer-controller -n kube-system | Out-Null
-kubectl rollout status deployment aws-load-balancer-controller -n kube-system --timeout=180s | Out-Null
-if ($LASTEXITCODE -ne 0) { throw 'ALB controller did not become ready after restart' }
-
-Ok 'ALB controller ready'
-
-Info 'Secrets Store CSI driver...'
-<#
-syncSecret stays off: values must never be copied into Kubernetes Secrets, or
-they would land in etcd, which is the whole point of mounting them as files.
-
-tokenRequests is required and defaults to empty. The AWS provider assumes the
-IRSA role of the pod whose volume it is mounting, which means it needs that
-pod's service account token — and the driver only supplies one when an audience
-is requested here. Without it every mount fails with:
-
-  CSI token error: serviceAccount.tokens not provided
-
-The audience must be sts.amazonaws.com to match what AWS STS expects.
-#>
-helm upgrade --install csi-secrets-store secrets-store-csi-driver/secrets-store-csi-driver `
-  --version $CSI_DRIVER_CHART_VERSION `
-  --namespace kube-system `
-  --set syncSecret.enabled=false `
-  --set enableSecretRotation=false `
-  --set "tokenRequests[0].audience=sts.amazonaws.com" `
-  --wait --timeout 5m | Out-Null
-if ($LASTEXITCODE -ne 0) { throw 'CSI driver install failed' }
-
-# The AWS provider chart bundles the driver as a subchart, enabled by default.
-# Leaving it on makes this release try to own a ServiceAccount named
-# secrets-store-csi-driver that the driver release above already owns, and helm
-# refuses with an ownership metadata error. Disable the subchart.
-#
-# fullnameOverride pins the provider's own ServiceAccount to
-# secrets-store-csi-driver-provider-aws. Without it the name is prefixed with
-# the release name and no longer matches the IRSA trust policy in Terraform.
-#
-# The chart exposes no serviceAccount.annotations value, so the IRSA annotation
-# is applied afterwards with kubectl.
-helm upgrade --install secrets-provider-aws aws-secrets-manager/secrets-store-csi-driver-provider-aws `
-  --version $CSI_AWS_CHART_VERSION `
-  --namespace kube-system `
-  --set "secrets-store-csi-driver.install=false" `
-  --set fullnameOverride=secrets-store-csi-driver-provider-aws `
-  --wait --timeout 5m | Out-Null
-if ($LASTEXITCODE -ne 0) { throw 'CSI AWS provider install failed' }
-
-kubectl annotate serviceaccount secrets-store-csi-driver-provider-aws `
-  -n kube-system "eks.amazonaws.com/role-arn=$($tf.csi_driver_role_arn)" --overwrite | Out-Null
-
-Ok 'Secrets Store CSI driver ready'
+# Autopilot reports no nodes until something is scheduled, so an empty list here
+# is normal rather than a symptom.
+$nodes = kubectl get nodes --no-headers 2>$null
+if ($nodes) { $nodes | ForEach-Object { Info $_ } } else { Info 'No nodes yet; Autopilot provisions them when pods are scheduled.' }
 
 # ---------------------------------------------------------------------------
 Step 'Building and pushing images'
@@ -312,37 +220,25 @@ if (-not $Tag) { $Tag = (git rev-parse --short HEAD) }
 Info "Tag: $Tag"
 
 if (-not $SkipBuild) {
-  <#
-  Docker rejects the ECR token with 400 Bad Request when it arrives on stdin
-  from PowerShell, and also when written directly to the redirected stream from
-  .NET — including as raw ASCII bytes with no BOM. Only a byte-clean shell pipe
-  works. Verified against docker 29.6.2: the same token succeeds via
-  --password and via a cmd pipe, and fails every other way.
-
-  --password would be simpler but puts the token on the command line, where any
-  local process can read it. The token goes to a temp file instead, is piped in
-  by cmd, and the file is removed immediately afterwards.
-  #>
-  $tokenFile = Join-Path ([IO.Path]::GetTempPath()) "ecr-$([guid]::NewGuid().ToString('N')).txt"
-  try {
-    $token = aws ecr get-login-password --region $tf.region
-    if ($LASTEXITCODE -ne 0) { throw 'could not obtain an ECR token' }
-
-    [IO.File]::WriteAllText($tokenFile, $token, (New-Object System.Text.UTF8Encoding($false)))
-    cmd /c "type `"$tokenFile`" | docker login --username AWS --password-stdin $registry" | Out-Null
-    if ($LASTEXITCODE -ne 0) { throw 'ECR login failed' }
-  } finally {
-    Remove-Item $tokenFile -Force -ErrorAction SilentlyContinue
-  }
+  # Installs a docker credential helper for the registry host, after which
+  # docker authenticates transparently.
+  #
+  # Considerably simpler than the ECR equivalent, which needed a token written
+  # to a temp file and piped in by cmd: docker rejected the same token from
+  # PowerShell's stdin with 400 Bad Request, and --password would have put it on
+  # the command line where any local process could read it.
+  gcloud auth configure-docker $registryHost --quiet 2>&1 | Out-Null
+  if ($LASTEXITCODE -ne 0) { throw 'could not configure the docker credential helper' }
 
   <#
   --provenance=false suppresses buildx's attestation manifests.
 
   With them on, every push produces a manifest LIST whose child manifests appear
-  in ECR as separate untagged images. That is a problem here for two reasons:
-  the repository fills with entries that look like junk but are not, and the
-  lifecycle rule that expires untagged images after a day can delete the children
-  of a live tag and corrupt it.
+  in the registry as separate untagged images. That is a problem here for two
+  reasons: the repository fills with entries that look like junk but are not,
+  and the cleanup policy that deletes untagged images after a day can delete the
+  children of a live tag and corrupt it. Artifact Registry behaves exactly as
+  ECR did in this respect.
 
   Attestations are worth having on a release pipeline. For a dev environment
   rebuilt daily they cost clarity and storage and buy nothing.
@@ -362,17 +258,17 @@ if (-not $SkipBuild) {
 Step 'Deploying the application'
 kubectl create namespace $tf.namespace --dry-run=client -o yaml | kubectl apply -f - | Out-Null
 
+# 15m rather than 10: the migration Job is a pre-upgrade hook, and on a cold
+# Autopilot cluster the scheduler has to provision capacity for it first.
 helm upgrade --install web-store $chartDir `
   --namespace $tf.namespace `
   -f "$chartDir/values-dev.yaml" `
   --set backend.image.repository=$($repos.backend) --set backend.image.tag=$Tag `
   --set frontend.image.repository=$($repos.frontend) --set frontend.image.tag=$Tag `
   --set migration.image.repository=$($repos.migrator) --set migration.image.tag=$Tag `
-  --set secrets.region=$($tf.region) `
-  --set secrets.databaseSecretName=$($tf.database_secret_name) `
-  --set secrets.appSecretName=$($tf.app_secret_name) `
-  --set serviceAccount.roleArn=$($tf.app_role_arn) `
-  --wait --timeout 10m
+  --set secrets.projectId=$($tf.project_id) `
+  --set secrets.prefix=$($tf.secret_prefix) `
+  --wait --timeout 15m
 if ($LASTEXITCODE -ne 0) {
   Write-Host "`nDeploy failed. Migration job logs:" -ForegroundColor Yellow
   kubectl logs -n $tf.namespace -l app.kubernetes.io/component=migrate --tail=50
@@ -381,17 +277,19 @@ if ($LASTEXITCODE -ne 0) {
 
 # ---------------------------------------------------------------------------
 Step 'Waiting for the load balancer'
-Info 'The controller provisions the ALB out of band; this usually takes 2-3 minutes.'
+Info 'The GKE Ingress controller provisions it out of band; this usually takes 3-5 minutes.'
+# .ip, not .hostname. A Google Cloud load balancer publishes an address; only an
+# ALB publishes a hostname.
 $address = ''
-for ($i = 0; $i -lt 60; $i++) {
-  $address = kubectl get ingress web-store -n $tf.namespace -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>$null
+for ($i = 0; $i -lt 90; $i++) {
+  $address = kubectl get ingress web-store -n $tf.namespace -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>$null
   if ($address) { break }
   Start-Sleep -Seconds 5
 }
-if (-not $address) { throw 'ALB did not appear. Check: kubectl describe ingress web-store -n ' + $tf.namespace }
+if (-not $address) { throw "Load balancer did not appear. Check: kubectl describe ingress web-store -n $($tf.namespace)" }
 
 Info "Address: $address"
-Info 'Waiting for the ALB target group to pass health checks...'
+Info 'Waiting for the backend to pass health checks...'
 for ($i = 0; $i -lt 60; $i++) {
   try {
     $r = Invoke-WebRequest "http://$address/healthz" -UseBasicParsing -TimeoutSec 5
@@ -405,8 +303,8 @@ Write-Host ""
 Write-Host "  Store is live:  http://$address" -ForegroundColor Green
 Write-Host ""
 Write-Host "  Brought up in $elapsed minutes. Cost while running: $cost" -ForegroundColor DarkGray
-Write-Host "  Sign-in details are in Secrets Manager, not printed here:" -ForegroundColor DarkGray
-Write-Host "    aws secretsmanager get-secret-value --secret-id $($tf.app_secret_name) --query SecretString --output text" -ForegroundColor DarkGray
+Write-Host "  Sign-in details are in Secret Manager, not printed here:" -ForegroundColor DarkGray
+Write-Host "    gcloud secrets versions access latest --secret=$($tf.secret_prefix)-seed-admin-password" -ForegroundColor DarkGray
 Write-Host ""
 Write-Host "  When you are done for the day:  .\scripts\down.ps1" -ForegroundColor Yellow
 Write-Host ""

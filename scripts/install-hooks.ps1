@@ -7,7 +7,7 @@
   by setting core.hooksPath. This is a per-clone setting, so run it once after
   cloning.
 
-  The pre-commit hook blocks credentials, private keys and hardcoded AWS
+  The pre-commit hook blocks credentials, private keys and hardcoded cloud
   account identifiers.
 #>
 
@@ -24,4 +24,4 @@ git update-index --chmod=+x .githooks/pre-commit 2>$null
 
 Write-Host 'Hooks enabled. core.hooksPath = .githooks' -ForegroundColor Green
 Write-Host 'Pre-commit will now block .env files, tfvars, tfstate, private keys,'
-Write-Host 'AWS access keys and hardcoded account ids in ARNs or ECR URIs.'
+Write-Host 'service account keys, API keys, and hardcoded project ids or numbers.'
