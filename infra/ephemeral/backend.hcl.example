@@ -1,18 +1,13 @@
-# Copy to backend.hcl and set the bucket from the persistent stack's output:
-#   terraform -chdir=../persistent output -raw state_bucket
-#
-# Then initialise with:
+# Copy to backend.hcl and fill in your project id, then:
 #   terraform init -backend-config=backend.hcl
 #
-# The bucket name embeds your account id, which is why this file is an example
-# rather than a committed default.
+# backend.hcl is gitignored because the bucket name embeds the project id, and
+# this repository is public. The up and down scripts derive the same values
+# from `gcloud config get-value project`, so they need no file.
+#
+# The bucket is created by the persistent stack; take the name from its
+# `state_bucket` output, or from its `backend_config` output which produces
+# exactly these two values.
 
-bucket = "web-store-tfstate-REPLACE_WITH_ACCOUNT_ID"
-key    = "ephemeral/terraform.tfstate"
-region = "us-east-1"
-
-encrypt = true
-
-# Native S3 state locking (Terraform 1.10+). Replaces the DynamoDB lock table
-# the older pattern needed — one less resource to create, pay for and clean up.
-use_lockfile = true
+bucket = "web-store-tfstate-REPLACE_WITH_PROJECT_ID"
+prefix = "ephemeral"

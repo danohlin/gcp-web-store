@@ -1,3 +1,20 @@
+variable "project_id" {
+  description = <<-EOT
+    GCP project id. Deliberately has no default: this repository is public, and
+    the project id must never be committed. Supply it through the gitignored
+    terraform.tfvars, or export TF_VAR_project_id.
+
+    The project *number* is never needed by hand — it is read at plan time from
+    the google_project data source.
+  EOT
+  type        = string
+
+  validation {
+    condition     = can(regex("^[a-z][a-z0-9-]{4,28}[a-z0-9]$", var.project_id))
+    error_message = "project_id must be a valid GCP project id (6-30 chars, lowercase letters, digits and hyphens)."
+  }
+}
+
 variable "project" {
   description = "Name prefix for every resource in this stack."
   type        = string
@@ -5,15 +22,15 @@ variable "project" {
 }
 
 variable "region" {
-  description = "AWS region."
+  description = "GCP region."
   type        = string
-  default     = "us-east-1"
+  default     = "us-central1"
 }
 
 variable "github_repository" {
-  description = "GitHub repository allowed to assume the CI role, as owner/name."
+  description = "GitHub repository whose workflows may impersonate the CI service account, as owner/name."
   type        = string
-  default     = "danohlin/web-store"
+  default     = "danohlin/gcp-web-store"
 
   validation {
     condition     = can(regex("^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$", var.github_repository))
@@ -21,62 +38,24 @@ variable "github_repository" {
   }
 }
 
-variable "github_owner_id" {
+variable "github_allowed_ref" {
   description = <<-EOT
-    Numeric GitHub account id of the repository owner.
+    Git ref permitted to impersonate the CI service account.
 
-    GitHub embeds immutable ids in the OIDC subject claim, which reads
-    "repo:OWNER@OWNERID/REPO@REPOID:ref:...", not the name-only form most
-    examples still show. The ids are what make the claim immutable: renaming or
-    transferring a repository cannot be used to impersonate the old one.
+    The main branch only, because that is the only ref that deploys. Pull
+    request builds run tests and need no cloud access at all.
 
-    Find with: gh api repos/OWNER/REPO --jq .owner.id
+    This is enforced in the provider's attribute_condition rather than in the
+    principalSet binding. A principalSet on the ref alone would match that ref
+    in *any* repository, which is the mirror image of the AWS trust-policy trap
+    the previous stack documented.
   EOT
-  type        = number
-  default     = 8661324
-}
-
-variable "github_repository_id" {
-  description = "Numeric GitHub repository id. Find with: gh api repos/OWNER/REPO --jq .id"
-  type        = number
-  default     = 1317833055
-}
-
-variable "github_allowed_subjects" {
-  description = <<-EOT
-    OIDC subjects permitted to assume the CI role. Overrides the default built
-    from github_repository and the numeric ids.
-
-    Defaults to the main branch only, because that is the only ref that deploys.
-    Pull request builds run tests and need no AWS access at all.
-
-    Never widen this to a bare "repo:*" — the subject condition is the only
-    thing stopping a workflow in someone else's repository from assuming this
-    role.
-  EOT
-  type        = list(string)
-  default     = null
-}
-
-variable "github_oidc_thumbprints" {
-  description = <<-EOT
-    Root CA thumbprints for token.actions.githubusercontent.com.
-
-    Both of GitHub's published values, since it serves from two CAs and rotates
-    between them. If GitHub ever changes CA entirely, refresh with:
-      openssl s_client -servername token.actions.githubusercontent.com \
-        -showcerts -connect token.actions.githubusercontent.com:443
-    and take the fingerprint of the LAST certificate in the chain.
-  EOT
-  type        = list(string)
-  default = [
-    "6938fd4d98bab03faadb97b34396831e3780aea1",
-    "1c58a3a8518e8759bf075b76b750d4f2df264fcd",
-  ]
+  type        = string
+  default     = "refs/heads/main"
 }
 
 variable "image_retention_count" {
-  description = "How many tagged images to keep per repository before the oldest are expired."
+  description = "How many tagged images to keep per component before the oldest are expired."
   type        = number
   default     = 10
 }

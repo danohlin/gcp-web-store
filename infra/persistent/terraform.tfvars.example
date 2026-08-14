@@ -1,11 +1,17 @@
-# Copy to terraform.tfvars and adjust if needed. Real .tfvars files are ignored
-# by git and blocked by the pre-commit hook.
+# Copy to terraform.tfvars and fill in project_id. Real .tfvars files are
+# ignored by git and blocked by the pre-commit hook.
 #
-# Note there is no account id here: it is read from your AWS credentials via
-# aws_caller_identity, so it never lands in the repository.
+# project_id is the one value with no default, precisely so that it cannot be
+# committed by accident. Everything else is derived: the project *number* is
+# read at plan time from the google_project data source, so it never lands in
+# the repository either.
+#
+# Alternatively, skip this file entirely and export TF_VAR_project_id.
+
+project_id = "REPLACE_WITH_PROJECT_ID"
 
 project = "web-store"
-region  = "us-east-1"
+region  = "us-central1"
 
-# Tagged images kept per repository before the oldest are expired.
+# Tagged images kept per component before the oldest are expired.
 image_retention_count = 10
