@@ -35,11 +35,16 @@ locals {
 resource "google_project_service" "this" {
   for_each = toset([
     "artifactregistry.googleapis.com",
+    # Needed only when the ephemeral stack's budget is enabled, but enabled
+    # here regardless: it is free, and discovering it is missing means a failed
+    # apply after the cluster and database have already been built.
+    "billingbudgets.googleapis.com",
     "cloudresourcemanager.googleapis.com",
     "compute.googleapis.com",
     "container.googleapis.com",
     "iam.googleapis.com",
     "iamcredentials.googleapis.com",
+    "monitoring.googleapis.com",
     "secretmanager.googleapis.com",
     "sqladmin.googleapis.com",
     "sts.googleapis.com",

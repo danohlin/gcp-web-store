@@ -122,6 +122,26 @@ foreach ($tool in 'terraform', 'gcloud', 'kubectl', 'helm', 'docker') {
   }
 }
 
+# Checked separately because it is not a command anyone runs directly, and
+# because its absence surfaces late and confusingly. kubectl shells out to it
+# for every GKE API call, so without it the run gets all the way through the
+# Terraform apply and the image pushes before dying at the first kubectl call
+# with "getting credentials: exec: executable gke-gcloud-auth-plugin.exe not
+# found" — which reads like a kubeconfig problem.
+if (-not (Get-Command gke-gcloud-auth-plugin -ErrorAction SilentlyContinue)) {
+  throw @'
+gke-gcloud-auth-plugin is not on PATH. kubectl cannot authenticate to GKE without it.
+
+  gcloud components install gke-gcloud-auth-plugin
+
+If that fails with "Cannot use bundled Python installation to update Google
+Cloud CLI in non-interactive mode", point CLOUDSDK_PYTHON at a copy first:
+
+  $env:CLOUDSDK_PYTHON = (gcloud components copy-bundled-python | Select-Object -Last 1)
+  gcloud components install gke-gcloud-auth-plugin --quiet
+'@
+}
+
 $projectId = (gcloud config get-value project 2>$null)
 if (-not $projectId -or $projectId -eq '(unset)') {
   throw 'No GCP project is configured. Run: gcloud config set project <PROJECT_ID>'

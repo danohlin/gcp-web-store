@@ -7,9 +7,18 @@ metadata:
   labels:
     {{- include "web-store.labels" . | nindent 4 }}
   annotations:
-    # The GKE Ingress controller provisions an external Application Load
-    # Balancer out of band. Nothing in Terraform knows about it, which is why
-    # the teardown order in scripts/down.ps1 matters — see NOTES.txt.
+    # This annotation, and NOT spec.ingressClassName, is what makes the GKE
+    # Ingress controller claim this object.
+    #
+    # GKE does not create an IngressClass resource — `kubectl get ingressclass`
+    # returns nothing on a fresh Autopilot cluster — so `ingressClassName: gce`
+    # matches no controller at all. The Ingress is then accepted by the API
+    # server, passes schema validation, and simply sits there: no address, and
+    # no events to say why, because no controller ever looked at it.
+    kubernetes.io/ingress.class: {{ .Values.ingress.className | quote }}
+    # The controller provisions an external Application Load Balancer out of
+    # band. Nothing in Terraform knows about it, which is why the teardown
+    # order in scripts/down.ps1 matters — see NOTES.txt.
     #
     # Health checks are not configured here as they were with the ALB
     # annotations. Container-native load balancing derives them from the
@@ -25,7 +34,6 @@ metadata:
     {{- toYaml . | nindent 4 }}
     {{- end }}
 spec:
-  ingressClassName: {{ .Values.ingress.className }}
   rules:
     - {{- if .Values.ingress.host }}
       host: {{ .Values.ingress.host | quote }}

@@ -119,6 +119,10 @@ ingress:
   enabled: true
   # The GKE Ingress controller. Provisions an external Application Load Balancer
   # out of band, which is why teardown order matters — see NOTES.txt.
+  #
+  # Rendered into the kubernetes.io/ingress.class annotation, not
+  # spec.ingressClassName: GKE ships no IngressClass object, so the field form
+  # matches nothing and the Ingress is silently never reconciled.
   className: gce
   # Name of a ManagedCertificate object to serve HTTPS. Without it the load
   # balancer listens on port 80 only and app.cookieSecure must stay false.

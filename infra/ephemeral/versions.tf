@@ -27,6 +27,20 @@ provider "google" {
   project = var.project_id
   region  = var.region
 
+  # Send X-Goog-User-Project on API calls that require a quota project.
+  #
+  # billingbudgets is one of them, and under user Application Default
+  # Credentials it refuses outright without it:
+  #
+  #   Error 403: Your application is authenticating by using local Application
+  #   Default Credentials. The billingbudgets.googleapis.com API requires a
+  #   quota project, which is not set by default.
+  #
+  # `gcloud auth application-default set-quota-project` alone is not enough —
+  # the provider only sends the header when this is on.
+  user_project_override = true
+  billing_project       = var.project_id
+
   default_labels = {
     project    = var.project
     managed-by = "terraform"

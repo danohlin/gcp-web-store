@@ -133,6 +133,20 @@ partial unique index on active carts — only exist in the database.
 ### Prerequisites
 
 - Terraform ≥ 1.10, gcloud CLI, kubectl, Helm, Docker
+- `gke-gcloud-auth-plugin`, which kubectl shells out to for every GKE API call:
+
+  ```powershell
+  gcloud components install gke-gcloud-auth-plugin
+  ```
+
+  If that fails with *"Cannot use bundled Python installation to update Google
+  Cloud CLI in non-interactive mode"*, point `CLOUDSDK_PYTHON` at a copy first:
+
+  ```powershell
+  $env:CLOUDSDK_PYTHON = (gcloud components copy-bundled-python | Select-Object -Last 1)
+  gcloud components install gke-gcloud-auth-plugin --quiet
+  ```
+
 - A GCP project with billing linked, and permission to create VPC, GKE,
   Cloud SQL, IAM and Secret Manager resources
 

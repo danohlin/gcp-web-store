@@ -111,12 +111,27 @@ resource "google_secret_manager_secret_version" "this" {
 
 # ------------------------------------------------------------------- access
 
+# The depends_on is load-bearing and cannot be inferred.
+#
+# The principal:// strings are built from variables, not from the cluster
+# resource, so Terraform sees no relationship and schedules these in parallel
+# with cluster creation. But the Workload Identity pool <project>.svc.id.goog
+# is created *by* the cluster, so the bindings race a ten-minute create and
+# lose, failing with:
+#
+#   Error 400: Identity Pool does not exist (<project>.svc.id.goog)
+#
+# which reads like a configuration error rather than an ordering one. A second
+# apply then succeeds, because by that point the cluster exists — the worst
+# kind of bug, since it looks transient.
 resource "google_secret_manager_secret_iam_member" "app" {
   for_each = google_secret_manager_secret.this
 
   secret_id = each.value.id
   role      = "roles/secretmanager.secretAccessor"
   member    = local.app_principal
+
+  depends_on = [google_container_cluster.main]
 }
 
 resource "google_secret_manager_secret_iam_member" "migrate" {
@@ -125,4 +140,6 @@ resource "google_secret_manager_secret_iam_member" "migrate" {
   secret_id = google_secret_manager_secret.this[each.key].id
   role      = "roles/secretmanager.secretAccessor"
   member    = local.migrate_principal
+
+  depends_on = [google_container_cluster.main]
 }

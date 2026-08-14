@@ -25,7 +25,10 @@ frontend:
     # Autopilot silently rewrote them — these values are what actually gets
     # scheduled, and are stated explicitly so the manifest tells the truth.
     #
-    # Note you are billed on the request, so bursting above it is not free.
+    # Verified on a real cluster: pods are admitted with exactly these numbers,
+    # and a memory limit above the request is honoured rather than being clamped
+    # up to it — so this runs on the container-optimized compute platform, where
+    # bursting is allowed. Billing is still on the request.
     requests:
       cpu: 50m
       memory: 52Mi
